@@ -1,0 +1,9 @@
+field_name,field_type,struct_type,external_field,internal_field,conversion_rule,validation_logic,bitfield_width,nested_struct_def,validation_field,array_size
+temperature,int32_t,external,temperature,temp_val,=,external->valid && recv_status,,,,,
+humidity,float,external,humidity,humid_val,=,recv_status == 1,,,,,
+pressure,double,external,pressure,press_val,press_convert_func,,,,,,
+valid,bool,external,valid,is_valid,=,,,,,,
+temp_val,float,internal,,,,,,,,,
+humid_val,float,internal,,,,,,,,,
+press_val,float,internal,,,,,,,,,
+is_valid,bool,internal,,,,,,,,is_valid,,

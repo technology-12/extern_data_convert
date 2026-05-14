@@ -6,6 +6,8 @@ Extern 变量映射工具 - GUI 主程序
 功能:
     1. 结构体用户变量简化操作 - 从已解析的结构体类型快速添加变量
     2. 目标头文件支持 - 选择另一个头文件，使用其中的变量作为映射目标
+    3. Markdown 文档生成 - 生成清晰的变量映射关系文档，方便大模型生成代码
+    4. 条件表达式与/或操作 - 支持多条件组合的有效性判断
 
 启动方式:
     python extern_mapper_gui.py
@@ -17,9 +19,486 @@ import sys
 import json
 import re
 from typing import Dict, List, Any, Optional
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.header_parser import HeaderParser
+
+
+class ConditionBuilder:
+    """条件表达式构建器 - 支持与/或操作"""
+
+    def __init__(self):
+        self.conditions: List[Dict] = []
+
+    def add_condition(self, var_ref: str, operator: str, value: str, logic: str = 'AND'):
+        """添加条件
+        
+        Args:
+            var_ref: 变量引用 (如 g_sensor_data->temperature)
+            operator: 操作符 (==, !=, >, <, >=, <=, etc.)
+            value: 比较值
+            logic: 逻辑连接符 (AND, OR)
+        """
+        self.conditions.append({
+            'var_ref': var_ref,
+            'operator': operator,
+            'value': value,
+            'logic': logic
+        })
+
+    def build_expression(self, extern_var: str) -> str:
+        """构建完整的条件表达式"""
+        if not self.conditions:
+            return ""
+
+        parts = []
+        for i, cond in enumerate(self.conditions):
+            # 构建变量引用
+            if '.' in cond['var_ref']:
+                var_ref = f"{extern_var}->{cond['var_ref']}"
+            else:
+                var_ref = f"{extern_var}->{cond['var_ref']}"
+
+            # 构建条件表达式
+            expr = f"{var_ref} {cond['operator']} {cond['value']}"
+            parts.append(expr)
+
+        # 组合表达式
+        if len(parts) == 1:
+            return parts[0]
+
+        result = parts[0]
+        for i in range(1, len(parts)):
+            logic = self.conditions[i].get('logic', 'AND')
+            result = f"({result}) {logic} ({parts[i]})"
+
+        return result
+
+    def to_dict(self) -> List[Dict]:
+        return self.conditions
+
+    @staticmethod
+    def from_dict(data: List[Dict]) -> 'ConditionBuilder':
+        builder = ConditionBuilder()
+        builder.conditions = data
+        return builder
+
+
+class MappingRule:
+    """映射规则数据类"""
+
+    def __init__(self, extern_member: str, user_var: str, op_type: str,
+                 condition: Optional[ConditionBuilder] = None,
+                 conversion: str = '=', custom_conv: str = ''):
+        self.extern_member = extern_member
+        self.user_var = user_var
+        self.op_type = op_type
+        self.condition = condition or ConditionBuilder()
+        self.conversion = conversion
+        self.custom_conv = custom_conv
+
+    def to_dict(self) -> Dict:
+        return {
+            'extern_member': self.extern_member,
+            'user_var': self.user_var,
+            'op_type': self.op_type,
+            'condition': self.condition.to_dict(),
+            'conversion': self.conversion,
+            'custom_conv': self.custom_conv
+        }
+
+    @staticmethod
+    def from_dict(data: Dict) -> 'MappingRule':
+        rule = MappingRule(
+            data['extern_member'],
+            data['user_var'],
+            data['op_type'],
+            data.get('conversion', '='),
+            data.get('custom_conv', '')
+        )
+        if 'condition' in data:
+            rule.condition = ConditionBuilder.from_dict(data['condition'])
+        return rule
+
+
+class MarkdownDocumentGenerator:
+    """Markdown 文档生成器 - 生成清晰的变量映射关系文档"""
+
+    def __init__(self, app):
+        self.app = app
+
+    def generate(self) -> str:
+        """生成完整的 Markdown 文档"""
+        lines = []
+
+        # 1. 文档标题和基本信息
+        lines.extend(self._generate_header())
+
+        # 2. 源头文件信息
+        lines.extend(self._generate_source_info())
+
+        # 3. 目标文件信息
+        lines.extend(self._generate_target_info())
+
+        # 4. 用户变量定义
+        lines.extend(self._generate_user_vars())
+
+        # 5. 映射关系详细说明
+        lines.extend(self._generate_mappings())
+
+        # 6. 代码模板
+        lines.extend(self._generate_code_templates())
+
+        # 7. 变量引用速查表
+        lines.extend(self._generate_reference_table())
+
+        return '\n'.join(lines)
+
+    def _generate_header(self) -> List[str]:
+        """生成文档头部"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return [
+            '# Struct Variable Mapping Specification',
+            '',
+            f'**Generated at:** {timestamp}',
+            f'**Source Header:** `{self.app.current_file.get() or "Not specified"}`',
+            f'**Target Header:** `{self.app.target_file.get() or "Not specified"}`',
+            '',
+            '## Overview',
+            '',
+            'This document describes the mapping relationships between extern variables',
+            'from source header files and user-defined target variables. The mapping rules',
+            'are designed to be clear and unambiguous for LLM-assisted code generation.',
+            '',
+            '---\n'
+        ]
+
+    def _generate_source_info(self) -> List[str]:
+        """生成源头文件信息"""
+        lines = [
+            '## Source Extern Variables',
+            '',
+            'The following extern variables are declared in the source header file.',
+            'These variables are read-only sources of data.',
+            '',
+        ]
+
+        if self.app.selected_extern_var:
+            var = self.app.selected_extern_var
+            lines.extend([
+                f'### `{var["name"]}`',
+                '',
+                f'- **Type:** `{var["type"]}`',
+                f'- **Is Struct:** {"Yes" if var.get("is_struct") else "No"}',
+            ])
+
+            if var.get('is_struct') and var.get('struct_type'):
+                lines.extend([
+                    f'- **Struct Type:** `{var["struct_type"]}`',
+                    '',
+                    '**Member Reference Pattern:**',
+                    '',
+                    '```c',
+                    f'{var["name"]}-><member_name>',
+                    '```',
+                    '',
+                    '**Available Members:**',
+                    '',
+                ])
+
+                members = self.app.parser.get_nested_members(var.get('struct_type', ''))
+                for m in members:
+                    member_name = m.get('full_path', m['name'])
+                    lines.append(f'- `{member_name}` : `{m["type"]}`')
+
+                lines.append('')
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_target_info(self) -> List[str]:
+        """生成目标头文件信息"""
+        lines = [
+            '## Target Extern Variables',
+            '',
+            'Variables from the target header file that are used as mapping targets.',
+            'These are typically `extern` declarations that will be assigned values.',
+            '',
+        ]
+
+        target_vars = [v for v in self.app.user_vars
+                      if v.get('source') in ('目标头文件', '目标结构体展开')]
+
+        if target_vars:
+            # 按变量名分组
+            struct_groups = {}
+            simple_vars = []
+
+            for var in target_vars:
+                if '.' in var['name']:
+                    base = var['name'].split('.')[0]
+                    if base not in struct_groups:
+                        struct_groups[base] = []
+                    struct_groups[base].append(var)
+                else:
+                    simple_vars.append(var)
+
+            # 输出结构体变量组
+            for base_name, members in struct_groups.items():
+                lines.append(f'### `{base_name}` (Struct Instance)')
+                lines.append('')
+
+                var_info = next((v for v in self.app.user_vars if v['name'] == base_name), None)
+                if var_info:
+                    lines.append(f'- **Type:** `{var_info["type"]}`')
+                    lines.append(f'- **Source:** `{var_info.get("source", "Unknown")}`')
+                    lines.append('')
+                    lines.append('**Member Reference Pattern:**')
+                    lines.append('')
+                    lines.append('```c')
+                    lines.append(f'{base_name}-><member_name>')
+                    lines.append('```')
+                    lines.append('')
+                    lines.append('**Accessible Members:**')
+                    lines.append('')
+
+                    for m in members:
+                        member_path = m['name'].split('.', 1)[1]
+                        lines.append(f'- `{member_path}` : `{m["type"]}`')
+
+                    lines.append('')
+
+            # 输出简单变量
+            if simple_vars:
+                lines.append('### Simple Variables')
+                lines.append('')
+                for var in simple_vars:
+                    lines.append(f'- `{var["name"]}` : `{var["type"]}`')
+                lines.append('')
+
+        else:
+            lines.append('*No target extern variables defined.*\n')
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_user_vars(self) -> List[str]:
+        """生成用户变量定义"""
+        lines = [
+            '## User-Defined Variables',
+            '',
+            'Variables defined by the user for mapping. These are typically local',
+            'variables or pointers that will receive values from the source variables.',
+            '',
+        ]
+
+        user_only_vars = [v for v in self.app.user_vars
+                         if v.get('source') not in ('目标头文件', '目标结构体展开')]
+
+        if user_only_vars:
+            struct_groups = {}
+            simple_vars = []
+
+            for var in user_only_vars:
+                if '.' in var['name']:
+                    base = var['name'].split('.')[0]
+                    if base not in struct_groups:
+                        struct_groups[base] = []
+                    struct_groups[base].append(var)
+                else:
+                    simple_vars.append(var)
+
+            # 结构体变量
+            for base_name, members in struct_groups.items():
+                lines.append(f'### `{base_name}` (User Struct)')
+                lines.append('')
+
+                var_info = next((v for v in self.app.user_vars if v['name'] == base_name), None)
+                if var_info:
+                    lines.append(f'- **Type:** `{var_info["type"]}`')
+                    lines.append(f'- **Description:** {var_info.get("desc", "N/A")}')
+                    lines.append('')
+                    lines.append('**Member Reference Pattern:**')
+                    lines.append('')
+                    lines.append('```c')
+                    lines.append(f'(*{base_name}).<member_name>')
+                    lines.append('```')
+                    lines.append('')
+                    lines.append('**Members:**')
+                    lines.append('')
+
+                    for m in members:
+                        member_path = m['name'].split('.', 1)[1]
+                        lines.append(f'- `{member_path}` : `{m["type"]}` - {m.get("desc", "")}')
+
+                    lines.append('')
+
+            # 简单变量
+            if simple_vars:
+                lines.append('### Simple Variables')
+                lines.append('')
+                lines.append('| Variable | Type | Description |')
+                lines.append('|----------|------|-------------|')
+                for var in simple_vars:
+                    desc = var.get('desc', '')
+                    lines.append(f'| `{var["name"]}` | `{var["type"]}` | {desc} |')
+                lines.append('')
+
+        else:
+            lines.append('*No user-defined variables.*\n')
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_mappings(self) -> List[str]:
+        """生成映射关系"""
+        lines = [
+            '## Mapping Relationships',
+            '',
+            'This section describes the detailed mapping rules between source and target variables.',
+            '',
+        ]
+
+        if not self.app.mappings:
+            lines.append('*No mappings defined.*\n')
+            lines.append('---\n')
+            return lines
+
+        for i, mapping in enumerate(self.app.mappings, 1):
+            lines.extend(self._generate_single_mapping(i, mapping))
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_single_mapping(self, index: int, mapping: Dict) -> List[str]:
+        """生成单个映射的详细说明"""
+        lines = [
+            f'### Mapping #{index}',
+            '',
+            f'| Property | Value |',
+            f'|----------|-------|',
+            f'| Source Member | `{mapping["extern_member"]}` |',
+            f'| Target Variable | `{mapping["user_var"]}` |',
+            f'| Operation Type | {mapping.get("op_type", "直接赋值")} |',
+            f'| Conversion | `{mapping.get("conversion", "=")}` |',
+            '',
+            '**C Code Reference:**',
+            '',
+            '```c',
+        ]
+
+        # 根据目标变量类型生成正确的代码引用
+        is_target = self.app._is_target_var(mapping['user_var'])
+        if is_target:
+            if '.' in mapping['user_var']:
+                base, member = mapping['user_var'].split('.', 1)
+                lines.append(f'{base}->{member} = ...')
+            else:
+                lines.append(f'{mapping["user_var"]} = ...')
+        else:
+            if '.' in mapping['user_var']:
+                base, member = mapping['user_var'].split('.', 1)
+                lines.append(f'(*{base}).{member} = ...')
+            else:
+                lines.append(f'(*{mapping["user_var"]}) = ...')
+
+        lines.append('```')
+        lines.append('')
+
+        # 条件说明
+        conditions = mapping.get('condition', [])
+        if isinstance(conditions, list) and conditions:
+            lines.append('**Conditions:**')
+            lines.append('')
+            for j, cond in enumerate(conditions, 1):
+                lines.append(f'{j}. `{cond.get("var_ref", "")}` {cond.get("operator", "")} {cond.get("value", "")}')
+                if cond.get('logic'):
+                    lines.append(f'   Logic: `{cond["logic"]}`')
+            lines.append('')
+
+        return lines
+
+    def _generate_code_templates(self) -> List[str]:
+        """生成代码模板"""
+        lines = [
+            '## Code Generation Templates',
+            '',
+            '### Function Signature Template',
+            '',
+            '```c',
+            'void assign_from_<extern_var>(',
+            '    <extern_type> *<extern_var>,  // Source data pointer',
+            '    <user_var_type> *<user_var>   // Target variable pointer',
+            ') {',
+            '    // Implementation',
+            '}',
+            '```',
+            '',
+            '### Assignment Statement Template',
+            '',
+            '```c',
+            '// Direct assignment',
+            '<target_ref> = <source_ref>;',
+            '',
+            '// Conditional assignment',
+            'if (<condition>) {',
+            '    <target_ref> = <source_ref>;',
+            '}',
+            '',
+            '// Conversion assignment',
+            '<target_ref> = <conversion>(<source_ref>);',
+            '```',
+            '',
+            '### Condition Expression Template',
+            '',
+            '```c',
+            '// Simple condition',
+            '<extern_var>-><member> <operator> <value>',
+            '',
+            '// Compound condition (AND)',
+            '(<condition1>) && (<condition2>)',
+            '',
+            '// Compound condition (OR)',
+            '(<condition1>) || (<condition2>)',
+            '',
+            '// Mixed conditions',
+            '(<condition1>) && (<condition2>) || (<condition3>)',
+            '```',
+            '',
+            '---\n'
+        ]
+        return lines
+
+    def _generate_reference_table(self) -> List[str]:
+        """生成变量引用速查表"""
+        lines = [
+            '## Quick Reference',
+            '',
+            '### Variable Reference Patterns',
+            '',
+            '| Variable Type | Reference Pattern | Example |',
+            '|---------------|-------------------|---------|',
+            '| Source Struct Member | `<var>-><member>` | `g_sensor_data->temperature` |',
+            '| Target Struct Member | `<var>-><member>` | `g_target->temperature` |',
+            '| User Struct Member | `(**<var>).<member>` | `(*my_sensor).temperature` |',
+            '| Simple User Var | `(*<var>)` | `(*my_temp)` |',
+            '',
+            '### Common Conversion Rules',
+            '',
+            '| Rule | Syntax | Description |',
+            '|------|--------|-------------|',
+            '| Direct | `=` | Direct assignment |',
+            '| Cast | `(type)` | Type casting |',
+            '| Scale | `* factor` | Multiplication |',
+            '| Offset | `+ offset` | Addition |',
+            '| Custom | User-defined | Custom expression |',
+            '',
+            '---\n',
+            '',
+            '*This document is machine-generated and designed for LLM code generation.*'
+        ]
+        return lines
 
 
 class ExternMapperApp:
@@ -27,9 +506,9 @@ class ExternMapperApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Extern 变量映射工具 v2.0")
-        self.root.geometry("1380x880")
-        self.root.minsize(1100, 720)
+        self.root.title("Extern 变量映射工具 v2.1")
+        self.root.geometry("1500x920")
+        self.root.minsize(1200, 760)
 
         self.style = ttk.Style()
         self.style.theme_use('clam')
@@ -45,6 +524,7 @@ class ExternMapperApp:
         self.user_vars: List[Dict] = []
         self.mappings: List[Dict] = []
         self.generated_code = ""
+        self.generated_markdown = ""
 
         self._build_menu()
         self._build_ui()
@@ -84,6 +564,10 @@ class ExternMapperApp:
         menubar.add_cascade(label="工具", menu=tool_menu)
         tool_menu.add_command(label="生成赋值代码", command=self._generate_code)
         tool_menu.add_command(label="复制生成的代码", command=self._copy_code)
+        tool_menu.add_separator()
+        tool_menu.add_command(label="生成 Markdown 文档", command=self._generate_markdown)
+        tool_menu.add_command(label="复制 Markdown 文档", command=self._copy_markdown)
+        tool_menu.add_command(label="保存 Markdown 文档...", command=self._save_markdown)
         tool_menu.add_separator()
         tool_menu.add_command(label="清空所有映射", command=self._clear_mappings)
 
@@ -378,11 +862,10 @@ class ExternMapperApp:
         self.map_op_type.pack(side=tk.LEFT, padx=5)
         self.map_op_type.bind('<<ComboboxSelected>>', self._on_op_type_changed)
 
-        self.map_condition_frame = ttk.Frame(add_map_frame)
+        self.map_condition_frame = ttk.LabelFrame(add_map_frame, text="条件表达式 (支持与/或)", padding=5)
         self.map_condition_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(self.map_condition_frame, text="条件/表达式:").pack(side=tk.LEFT)
-        self.map_condition = ttk.Entry(self.map_condition_frame, width=40)
-        self.map_condition.pack(side=tk.LEFT, padx=5)
+
+        self._build_condition_builder()
 
         row_conv = ttk.Frame(add_map_frame)
         row_conv.pack(fill=tk.X, pady=2)
@@ -408,7 +891,7 @@ class ExternMapperApp:
         map_list_frame = ttk.Frame(parent)
         map_list_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('extern_member', 'operator', 'user_var', 'conversion', 'condition')
+        columns = ('extern_member', 'operator', 'user_var', 'conversion', 'condition_count')
         self.mapping_tree = ttk.Treeview(
             map_list_frame, columns=columns, show='headings',
             selectmode='browse', height=8
@@ -417,12 +900,12 @@ class ExternMapperApp:
         self.mapping_tree.heading('operator', text='操作')
         self.mapping_tree.heading('user_var', text='用户变量')
         self.mapping_tree.heading('conversion', text='转换规则')
-        self.mapping_tree.heading('condition', text='条件/表达式')
+        self.mapping_tree.heading('condition_count', text='条件数')
         self.mapping_tree.column('extern_member', width=120, minwidth=80)
         self.mapping_tree.column('operator', width=80, minwidth=50)
         self.mapping_tree.column('user_var', width=100, minwidth=60)
         self.mapping_tree.column('conversion', width=80, minwidth=50)
-        self.mapping_tree.column('condition', width=150, minwidth=80)
+        self.mapping_tree.column('condition_count', width=60, minwidth=40, anchor=tk.CENTER)
 
         map_scroll = ttk.Scrollbar(map_list_frame, orient=tk.VERTICAL, command=self.mapping_tree.yview)
         self.mapping_tree.configure(yscrollcommand=map_scroll.set)
@@ -432,7 +915,127 @@ class ExternMapperApp:
 
         self.mapping_tree.bind('<<TreeviewSelect>>', self._on_mapping_select)
 
+    def _build_condition_builder(self):
+        """构建条件表达式输入界面"""
+        cond_row1 = ttk.Frame(self.map_condition_frame)
+        cond_row1.pack(fill=tk.X, pady=2)
+
+        ttk.Label(cond_row1, text="变量:").pack(side=tk.LEFT)
+        self.cond_var_ref = ttk.Combobox(cond_row1, width=15, state='readonly')
+        self.cond_var_ref.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(cond_row1, text="操作符:").pack(side=tk.LEFT)
+        self.cond_operator = ttk.Combobox(
+            cond_row1, width=8, state='readonly',
+            values=['==', '!=', '>', '<', '>=', '<=', '&&', '||']
+        )
+        self.cond_operator.set('==')
+        self.cond_operator.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(cond_row1, text="值:").pack(side=tk.LEFT)
+        self.cond_value = ttk.Entry(cond_row1, width=15)
+        self.cond_value.pack(side=tk.LEFT, padx=5)
+
+        cond_row2 = ttk.Frame(self.map_condition_frame)
+        cond_row2.pack(fill=tk.X, pady=2)
+
+        ttk.Label(cond_row2, text="逻辑连接:").pack(side=tk.LEFT)
+        self.cond_logic = ttk.Combobox(
+            cond_row2, width=8, state='readonly',
+            values=['AND', 'OR']
+        )
+        self.cond_logic.set('AND')
+        self.cond_logic.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(cond_row2, text="➕ 添加条件", command=self._add_condition).pack(side=tk.LEFT, padx=5)
+        ttk.Button(cond_row2, text="🗑️ 清空", command=self._clear_conditions).pack(side=tk.LEFT, padx=2)
+
+        self.cond_preview_frame = ttk.LabelFrame(self.map_condition_frame, text="条件预览", padding=5)
+        self.cond_preview_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        self.cond_preview_text = tk.Text(
+            self.cond_preview_frame, height=4, font=('Consolas', 9),
+            wrap=tk.WORD, bg='#f5f5f5'
+        )
+        self.cond_preview_text.pack(fill=tk.BOTH, expand=True)
+
+        self.current_conditions: List[Dict] = []
+
+    def _add_condition(self):
+        """添加一个条件到当前条件列表"""
+        var_ref = self.cond_var_ref.get()
+        operator = self.cond_operator.get()
+        value = self.cond_value.get().strip()
+        logic = self.cond_logic.get()
+
+        if not var_ref:
+            messagebox.showwarning("警告", "请选择变量！")
+            return
+        if not value:
+            messagebox.showwarning("警告", "请输入比较值！")
+            return
+
+        self.current_conditions.append({
+            'var_ref': var_ref,
+            'operator': operator,
+            'value': value,
+            'logic': logic if len(self.current_conditions) > 0 else ''
+        })
+
+        self._update_condition_preview()
+        self.cond_value.delete(0, tk.END)
+
+    def _clear_conditions(self):
+        """清空所有条件"""
+        self.current_conditions.clear()
+        self._update_condition_preview()
+
+    def _update_condition_preview(self):
+        """更新条件预览"""
+        self.cond_preview_text.delete('1.0', tk.END)
+
+        if not self.current_conditions:
+            self.cond_preview_text.insert('1.0', "(无条件)")
+            return
+
+        ext_var = self._get_extern_var_name()
+        expr_parts = []
+
+        for i, cond in enumerate(self.current_conditions):
+            var_full = f"{ext_var}->{cond['var_ref']}"
+            expr = f"{var_full} {cond['operator']} {cond['value']}"
+            expr_parts.append(expr)
+
+        if len(expr_parts) == 1:
+            result = expr_parts[0]
+        else:
+            result = expr_parts[0]
+            for i in range(1, len(expr_parts)):
+                logic = self.current_conditions[i].get('logic', 'AND')
+                result += f"\n{logic} ({expr_parts[i]})"
+
+        self.cond_preview_text.insert('1.0', result)
+
+    def _get_extern_var_name(self) -> str:
+        if self.selected_extern_var:
+            return self.selected_extern_var['name']
+        return "ext_var"
+
     def _build_bottom_panel(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        code_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(code_frame, text=" 💻 生成的代码 ")
+
+        self._build_code_tab(code_frame)
+
+        md_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(md_frame, text=" 📝 Markdown 文档 ")
+
+        self._build_markdown_tab(md_frame)
+
+    def _build_code_tab(self, parent):
         code_frame = ttk.LabelFrame(parent, text=" 📝 生成的代码 ", padding=5)
         code_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -465,6 +1068,24 @@ class ExternMapperApp:
         self.code_text.tag_configure('number', foreground='#b5cea8')
         self.code_text.tag_configure('function', foreground='#dcdcaa')
 
+    def _build_markdown_tab(self, parent):
+        md_frame = ttk.LabelFrame(parent, text=" 📝 Markdown 文档 ", padding=5)
+        md_frame.pack(fill=tk.BOTH, expand=True)
+
+        toolbar = ttk.Frame(md_frame)
+        toolbar.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(toolbar, text="📄 生成文档", command=self._generate_markdown, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📋 复制文档", command=self._copy_markdown).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="💾 保存文档...", command=self._save_markdown).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📋 复制代码+文档", command=self._copy_code_and_markdown).pack(side=tk.LEFT, padx=2)
+
+        self.md_text = scrolledtext.ScrolledText(
+            md_frame, wrap=tk.WORD, font=('Consolas', 10),
+            bg='#ffffff', fg='#333333', height=12
+        )
+        self.md_text.pack(fill=tk.BOTH, expand=True)
+
     def _open_file(self):
         file_path = filedialog.askopenfilename(
             title="选择头文件",
@@ -486,6 +1107,7 @@ class ExternMapperApp:
 
         self._refresh_extern_list()
         self._update_struct_type_combo()
+        self._update_condition_var_combo()
 
         summary = self.parser.get_summary()
         self.parse_info_var.set(
@@ -516,6 +1138,8 @@ class ExternMapperApp:
             return
 
         self._refresh_target_var_list()
+        self._update_struct_type_combo()
+        self._update_condition_var_combo()
 
         summary = self.target_parser.get_summary()
         self.target_info_var.set(
@@ -525,6 +1149,20 @@ class ExternMapperApp:
             f"Typedef: {summary['typedef_count']}"
         )
         self.status_var.set(f"已加载目标头文件: {file_path}")
+
+    def _update_condition_var_combo(self):
+        """更新条件变量选择下拉框"""
+        values = []
+        if self.selected_extern_var and self.selected_extern_var.get('is_struct'):
+            members = self.parser.get_nested_members(
+                self.selected_extern_var.get('struct_type', '')
+            )
+            values = [m.get('full_path', m['name']) for m in members]
+        self.cond_var_ref['values'] = values
+        if values:
+            self.cond_var_ref.set(values[0])
+        else:
+            self.cond_var_ref.set('')
 
     def _refresh_extern_list(self):
         self.extern_tree.delete(*self.extern_tree.get_children())
@@ -580,6 +1218,7 @@ class ExternMapperApp:
                 self.parser.parse_file(header_file)
                 self._refresh_extern_list()
                 self._update_struct_type_combo()
+                self._update_condition_var_combo()
 
             target_header = config.get('target_header_file', '')
             if target_header and os.path.exists(target_header):
@@ -587,6 +1226,7 @@ class ExternMapperApp:
                 self.target_parser.parse_file(target_header)
                 self._refresh_target_var_list()
                 self._update_struct_type_combo()
+                self._update_condition_var_combo()
 
             messagebox.showinfo("成功", "配置导入成功！")
             self.status_var.set(f"已导入配置: {os.path.basename(file_path)}")
@@ -632,6 +1272,7 @@ class ExternMapperApp:
 
         self._refresh_member_list()
         self._update_extern_member_combo()
+        self._update_condition_var_combo()
 
         self.member_title_var.set(
             f"变量: {var_name} ({self.selected_extern_var['type']})"
@@ -1138,7 +1779,6 @@ class ExternMapperApp:
         ext_member = self.map_extern_member.get()
         user_var = self.map_user_var.get()
         op_type = self.map_op_type.get()
-        condition = self.map_condition.get().strip()
         conversion = self.map_conversion.get()
         custom_conv = self.map_custom_conv.get().strip()
 
@@ -1163,15 +1803,15 @@ class ExternMapperApp:
             'extern_member': ext_member,
             'user_var': user_var,
             'op_type': op_type,
-            'condition': condition,
+            'condition': self.current_conditions.copy(),
             'conversion': conversion,
             'conv_rule': conv_rule,
         }
 
         self.mappings.append(mapping)
         self._refresh_mapping_list()
+        self._clear_conditions()
 
-        self.map_condition.delete(0, tk.END)
         self.map_custom_conv.delete(0, tk.END)
 
         self.status_var.set(f"已添加映射: {ext_member} → {user_var} ({op_type})")
@@ -1211,7 +1851,7 @@ class ExternMapperApp:
                             'extern_member': ext_name,
                             'user_var': uv['name'],
                             'op_type': '直接赋值',
-                            'condition': '',
+                            'condition': [],
                             'conversion': '=',
                             'conv_rule': '=',
                         })
@@ -1257,21 +1897,24 @@ class ExternMapperApp:
             self.map_extern_member.set(m['extern_member'])
             self.map_user_var.set(m['user_var'])
             self.map_op_type.set(m['op_type'])
-            self.map_condition.delete(0, tk.END)
-            self.map_condition.insert(0, m.get('condition', ''))
             self.map_conversion.set(m.get('conversion', '='))
             self.map_custom_conv.delete(0, tk.END)
             self.map_custom_conv.insert(0, m.get('conv_rule', '='))
 
+            self.current_conditions = m.get('condition', []).copy()
+            self._update_condition_preview()
+
     def _refresh_mapping_list(self):
         self.mapping_tree.delete(*self.mapping_tree.get_children())
         for m in self.mappings:
+            conditions = m.get('condition', [])
+            cond_count = len(conditions) if isinstance(conditions, list) else 0
             self.mapping_tree.insert('', tk.END, values=(
                 m['extern_member'],
                 m['op_type'],
                 m['user_var'],
                 m.get('conversion', '='),
-                m.get('condition', '')
+                cond_count
             ))
 
     def _clear_mappings(self):
@@ -1279,6 +1922,7 @@ class ExternMapperApp:
             self.mappings.clear()
             self._refresh_mapping_list()
             self.code_text.delete('1.0', tk.END)
+            self.md_text.delete('1.0', tk.END)
             self.status_var.set("已清空所有映射")
 
     def _get_user_var_type(self, var_name: str) -> str:
@@ -1292,38 +1936,6 @@ class ExternMapperApp:
             if v['name'] == var_name:
                 return v
         return None
-
-    def _get_extern_var_name(self) -> str:
-        if self.selected_extern_var:
-            return self.selected_extern_var['name']
-        return "ext_var"
-
-    def _generate_code(self):
-        if not self.mappings:
-            messagebox.showwarning("警告", "请先添加映射关系！")
-            return
-
-        template = self.code_template.get()
-        ext_var_name = self._get_extern_var_name()
-
-        if template == '赋值函数':
-            code = self._gen_assignment_function(ext_var_name)
-        elif template == '条件判断函数':
-            code = self._gen_condition_function(ext_var_name)
-        elif template == '完整转换函数':
-            code = self._gen_full_function(ext_var_name)
-        elif template == '仅赋值语句':
-            code = self._gen_assignment_statements(ext_var_name)
-        elif template == '仅判断语句':
-            code = self._gen_condition_statements(ext_var_name)
-        else:
-            code = self._gen_assignment_function(ext_var_name)
-
-        self.generated_code = code
-        self.code_text.delete('1.0', tk.END)
-        self.code_text.insert('1.0', code)
-        self._apply_syntax_highlighting()
-        self.status_var.set(f"已生成代码 (模板: {template})")
 
     def _is_target_var(self, var_name: str) -> bool:
         info = self._get_user_var_info(var_name)
@@ -1381,12 +1993,70 @@ class ExternMapperApp:
                         result.append((base, tinfo['type']))
         return result
 
+    def _build_condition_expression(self, conditions: List[Dict], ext_var: str) -> str:
+        """构建条件表达式字符串"""
+        if not conditions or not isinstance(conditions, list):
+            return ""
+
+        parts = []
+        for i, cond in enumerate(conditions):
+            var_ref = cond.get('var_ref', '')
+            operator = cond.get('operator', '==')
+            value = cond.get('value', '')
+
+            if not var_ref or not value:
+                continue
+
+            var_full = f"{ext_var}->{var_ref}"
+            expr = f"{var_full} {operator} {value}"
+            parts.append(expr)
+
+        if not parts:
+            return ""
+
+        if len(parts) == 1:
+            return parts[0]
+
+        result = f"({parts[0]})"
+        for i in range(1, len(parts)):
+            logic = conditions[i].get('logic', 'AND')
+            result += f" {logic} ({parts[i]})"
+
+        return result
+
+    def _generate_code(self):
+        if not self.mappings:
+            messagebox.showwarning("警告", "请先添加映射关系！")
+            return
+
+        template = self.code_template.get()
+        ext_var_name = self._get_extern_var_name()
+
+        if template == '赋值函数':
+            code = self._gen_assignment_function(ext_var_name)
+        elif template == '条件判断函数':
+            code = self._gen_condition_function(ext_var_name)
+        elif template == '完整转换函数':
+            code = self._gen_full_function(ext_var_name)
+        elif template == '仅赋值语句':
+            code = self._gen_assignment_statements(ext_var_name)
+        elif template == '仅判断语句':
+            code = self._gen_condition_statements(ext_var_name)
+        else:
+            code = self._gen_assignment_function(ext_var_name)
+
+        self.generated_code = code
+        self.code_text.delete('1.0', tk.END)
+        self.code_text.insert('1.0', code)
+        self._apply_syntax_highlighting()
+        self.status_var.set(f"已生成代码 (模板: {template})")
+
     def _gen_assignment_function(self, ext_var_name: str) -> str:
         lines = []
         lines.append(f"/*")
         lines.append(f" * 自动生成的赋值函数")
         lines.append(f" * Extern 变量: {ext_var_name}")
-        lines.append(f" * 生成时间: {self._get_timestamp()}")
+        lines.append(f" * 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f" */")
 
         target_externs = self._collect_target_externs()
@@ -1406,18 +2076,27 @@ class ExternMapperApp:
             ext_member = m['extern_member']
             user_var = m['user_var']
             op_type = m['op_type']
-            condition = m.get('condition', '')
+            condition = m.get('condition', [])
             conv_rule = m.get('conv_rule', '=')
 
             lhs = self._get_var_lhs(user_var)
+            condition_expr = self._build_condition_expression(condition, ext_var_name)
 
             if op_type == '直接赋值':
-                if conv_rule == '=':
-                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                if condition_expr:
+                    lines.append(f"    if ({condition_expr}) {{")
+                    if conv_rule == '=':
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                    lines.append(f"    }}")
                 else:
-                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                    if conv_rule == '=':
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
             elif op_type == '条件赋值':
-                cond = condition if condition else f"{ext_var_name}->{ext_member} != 0"
+                cond = condition_expr if condition_expr else f"{ext_var_name}->{ext_member} != 0"
                 if conv_rule == '=':
                     lines.append(f"    if ({cond}) {{")
                     lines.append(f"        {lhs} = {ext_var_name}->{ext_member};")
@@ -1428,8 +2107,8 @@ class ExternMapperApp:
                     lines.append(f"    }}")
             elif op_type == '逻辑判断':
                 lines.append(f"    /* 逻辑判断: {ext_member} vs {user_var} */")
-                if condition:
-                    lines.append(f"    if ({condition}) {{")
+                if condition_expr:
+                    lines.append(f"    if ({condition_expr}) {{")
                     lines.append(f"        /* TODO: 处理判断逻辑 */")
                     lines.append(f"    }}")
                 else:
@@ -1437,8 +2116,8 @@ class ExternMapperApp:
                     lines.append(f"        /* TODO: {user_var} 为真时的处理 */")
                     lines.append(f"    }}")
             elif op_type == '自定义表达式':
-                expr = condition if condition else f"{lhs} = {ext_var_name}->{ext_member}"
-                lines.append(f"    {expr};")
+                expr = condition_expr if condition_expr else f"{lhs} = {ext_var_name}->{ext_member}"
+                lines.append(f"    {lhs} = {expr};")
 
         lines.append("}")
         return "\n".join(lines)
@@ -1457,11 +2136,12 @@ class ExternMapperApp:
 
         for m in self.mappings:
             ext_member = m['extern_member']
-            condition = m.get('condition', '')
+            condition = m.get('condition', [])
 
-            if condition:
+            condition_expr = self._build_condition_expression(condition, ext_var_name)
+            if condition_expr:
                 lines.append(f"    /* 检查: {ext_member} */")
-                lines.append(f"    if (!({condition})) {{")
+                lines.append(f"    if (!({condition_expr})) {{")
                 lines.append(f"        result = 0;")
                 lines.append(f"    }}")
             else:
@@ -1478,7 +2158,7 @@ class ExternMapperApp:
         lines.append(f"/*")
         lines.append(f" * 自动生成的完整转换函数")
         lines.append(f" * Extern 变量: {ext_var_name}")
-        lines.append(f" * 生成时间: {self._get_timestamp()}")
+        lines.append(f" * 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f" */")
 
         target_externs = self._collect_target_externs()
@@ -1494,14 +2174,14 @@ class ExternMapperApp:
         lines.append(f"    if ({ext_var_name} == NULL) return -1;")
         lines.append("")
 
-        cond_mappings = [m for m in self.mappings if m['op_type'] in ('逻辑判断', '条件赋值')]
+        cond_mappings = [m for m in self.mappings if m['op_type'] in ('逻辑判断', '条件赋值') and m.get('condition')]
         if cond_mappings:
             lines.append(f"    /* ── 条件检查 ── */")
             for m in cond_mappings:
                 ext_member = m['extern_member']
-                condition = m.get('condition', '')
-                if condition:
-                    lines.append(f"    if (!({condition})) {{")
+                condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
+                if condition_expr:
+                    lines.append(f"    if (!({condition_expr})) {{")
                     lines.append(f"        return -1;  /* 条件不满足: {ext_member} */")
                     lines.append(f"    }}")
             lines.append("")
@@ -1513,13 +2193,22 @@ class ExternMapperApp:
                 ext_member = m['extern_member']
                 user_var = m['user_var']
                 conv_rule = m.get('conv_rule', '=')
+                condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
 
                 lhs = self._get_var_lhs(user_var)
 
-                if conv_rule == '=':
-                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                if condition_expr:
+                    lines.append(f"    if ({condition_expr}) {{")
+                    if conv_rule == '=':
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                    lines.append(f"    }}")
                 else:
-                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                    if conv_rule == '=':
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
             lines.append("")
 
         lines.append(f"    return 0;  /* 成功 */")
@@ -1534,13 +2223,22 @@ class ExternMapperApp:
             ext_member = m['extern_member']
             user_var = m['user_var']
             conv_rule = m.get('conv_rule', '=')
+            condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
 
             lhs = self._get_var_lhs(user_var)
 
-            if conv_rule == '=':
-                lines.append(f"{lhs} = {ext_var_name}->{ext_member};")
+            if condition_expr:
+                lines.append(f"if ({condition_expr}) {{")
+                if conv_rule == '=':
+                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                else:
+                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                lines.append(f"}}")
             else:
-                lines.append(f"{lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                if conv_rule == '=':
+                    lines.append(f"{lhs} = {ext_var_name}->{ext_member};")
+                else:
+                    lines.append(f"{lhs} = {ext_var_name}->{ext_member} {conv_rule};")
 
         return "\n".join(lines)
 
@@ -1550,10 +2248,10 @@ class ExternMapperApp:
 
         for m in self.mappings:
             ext_member = m['extern_member']
-            condition = m.get('condition', '')
+            condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
 
-            if condition:
-                lines.append(f"if ({condition}) {{")
+            if condition_expr:
+                lines.append(f"if ({condition_expr}) {{")
                 lines.append(f"    /* {ext_member} 条件满足 */")
                 lines.append(f"}}")
             else:
@@ -1603,6 +2301,64 @@ class ExternMapperApp:
             self.code_text.tag_add('comment', pos, line_end)
             start = line_end
 
+    def _generate_markdown(self):
+        if not self.mappings:
+            messagebox.showwarning("警告", "请先添加映射关系！")
+            return
+
+        generator = MarkdownDocumentGenerator(self)
+        self.generated_markdown = generator.generate()
+
+        self.md_text.delete('1.0', tk.END)
+        self.md_text.insert('1.0', self.generated_markdown)
+        self.status_var.set("已生成 Markdown 文档")
+
+    def _copy_markdown(self):
+        md = self.md_text.get('1.0', tk.END).strip()
+        if not md:
+            messagebox.showwarning("警告", "没有可复制的文档！请先生成文档。")
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(md)
+        self.status_var.set("Markdown 文档已复制到剪贴板")
+
+    def _copy_code_and_markdown(self):
+        code = self.code_text.get('1.0', tk.END).strip()
+        md = self.md_text.get('1.0', tk.END).strip()
+
+        if not code and not md:
+            messagebox.showwarning("警告", "请先生成代码或文档。")
+            return
+
+        content = f"{md}\n\n---\n\n## Generated Code\n\n```c\n{code}\n```"
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.status_var.set("代码和文档已复制到剪贴板")
+
+    def _save_markdown(self):
+        md = self.md_text.get('1.0', tk.END).strip()
+        if not md:
+            messagebox.showwarning("警告", "没有可保存的文档！请先生成文档。")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="保存 Markdown 文档",
+            defaultextension=".md",
+            filetypes=[("Markdown 文件", "*.md"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(md)
+            messagebox.showinfo("成功", f"文档已保存到: {file_path}")
+            self.status_var.set(f"文档已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
     def _copy_code(self):
         code = self.code_text.get('1.0', tk.END).strip()
         if not code:
@@ -1635,11 +2391,6 @@ class ExternMapperApp:
         except Exception as e:
             messagebox.showerror("错误", f"保存失败: {e}")
 
-    @staticmethod
-    def _get_timestamp() -> str:
-        from datetime import datetime
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     def _show_help(self):
         help_text = """
 ═══════════════════════════════════════════
@@ -1651,34 +2402,43 @@ class ExternMapperApp:
    • 选择包含 extern 声明的 .h 文件
    • 工具会自动解析 extern 变量和结构体定义
 
-2. 选择 Extern 变量
+2. 条件表达式与/或操作（新增）
+   • 在映射配置中选择 Extern 成员和用户变量
+   • 在条件表达式区域添加多个条件
+   • 每个条件包含: 变量引用、操作符(=、!=、>、<等)、比较值
+   • 多条件之间可通过"逻辑连接"(AND/OR)组合
+   • 预览区域实时显示组合后的完整表达式
+
+3. 选择 Extern 变量
    • 在左侧列表中点击选择一个 extern 变量
    • 中间面板会显示该变量的成员（如果是结构体）
 
-3. 定义用户变量
+4. 定义用户变量
    • 在右侧"用户变量"标签页中添加自定义变量
    • 支持单个添加、批量添加
    • 【新增】从结构体添加：选择结构体类型，一键添加所有成员
    • 【新增】结构体类型下拉框：快速选择已解析的结构体类型
 
-4. 目标头文件变量（新增功能）
+5. 目标头文件变量（新增功能）
    • 在左侧面板选择目标头文件
    • 目标头文件包含转换后的变量定义和 extern 声明
    • 在"目标头文件变量"标签页中查看和选择变量
    • 可导入选中变量、全部变量、或结构体成员作为映射目标
 
-5. 配置映射关系
+6. 配置映射关系
    • 在"映射关系"标签页中选择 extern 成员和用户变量
    • 选择操作类型：直接赋值、条件赋值、逻辑判断、自定义表达式
+   • 【新增】添加多个条件表达式，支持与/或逻辑组合
    • 可设置转换规则和条件表达式
    • 【新增】自动匹配：按名称自动匹配 extern 成员和用户变量
 
-6. 生成代码
-   • 点击"生成代码"按钮
-   • 选择代码模板（赋值函数、条件判断函数等）
-   • 可复制或保存生成的代码
+7. 生成代码和文档
+   • 点击"生成代码"按钮生成 C 代码
+   • 【新增】点击"生成文档"按钮生成 Markdown 文档
+   • 【新增】可复制代码+文档组合，方便大模型处理
+   • 可复制或保存生成的代码/文档
 
-7. 导入/导出
+8. 导入/导出
    • 支持将映射配置导出为 JSON 文件
    • 可导入之前保存的配置（包含目标头文件路径）
 
@@ -1688,7 +2448,7 @@ class ExternMapperApp:
 """
         dialog = tk.Toplevel(self.root)
         dialog.title("使用说明")
-        dialog.geometry("560x650")
+        dialog.geometry("560x700")
         dialog.transient(self.root)
 
         text = scrolledtext.ScrolledText(dialog, wrap=tk.WORD, font=('Microsoft YaHei UI', 10))
@@ -1701,14 +2461,14 @@ class ExternMapperApp:
     def _show_about(self):
         messagebox.showinfo(
             "关于",
-            "Extern 变量映射工具 v2.0\n\n"
+            "Extern 变量映射工具 v2.1\n\n"
             "用于读取C语言头文件中的 extern 变量声明，\n"
             "并将 extern 变量的成员与用户自定义变量\n"
             "进行对应赋值和逻辑判断的代码生成工具。\n\n"
-            "v2.0 新增功能:\n"
-            "• 结构体用户变量简化操作\n"
-            "• 目标头文件变量支持\n"
-            "• 自动匹配映射\n\n"
+            "v2.1 新增功能:\n"
+            "• Markdown 文档生成 - 清晰描述变量映射关系\n"
+            "• 条件表达式与/或操作 - 支持多条件组合判断\n"
+            "• 代码+文档组合复制 - 方便大模型处理\n\n"
             "基于 Python + tkinter 构建\n"
             "© 2026 Struct Converter Toolkit"
         )

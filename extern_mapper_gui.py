@@ -87,8 +87,15 @@ class LLMService:
         """检查是否已配置"""
         return bool(self.base_url and self.model)
 
-    def call_llm(self, prompt: str, system_prompt: str = "") -> tuple:
-        """调用 LLM API
+    def call_llm(self, prompt: str, system_prompt: str = "",
+                 max_retries: int = 2, timeout: int = 300) -> tuple:
+        """调用 LLM API，支持自动重试和超时控制
+
+        Args:
+            prompt: 用户提示
+            system_prompt: 系统提示
+            max_retries: 最大重试次数
+            timeout: 超时秒数（默认300秒）
 
         Returns:
             (success: bool, response_text: str)
@@ -115,23 +122,45 @@ class LLMService:
             "max_tokens": 8192,
         })
 
-        try:
-            req = urllib.request.Request(
-                url, data=body.encode('utf-8'), headers=headers, method='POST'
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                result = json.loads(resp.read().decode('utf-8'))
-                content = result['choices'][0]['message']['content']
-                return True, content
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8', errors='replace')
-            return False, f"HTTP 错误 {e.code}: {error_body}"
-        except urllib.error.URLError as e:
-            return False, f"连接错误: {e.reason}\n请检查 URL 是否正确，服务是否已启动"
-        except json.JSONDecodeError:
-            return False, "响应解析失败：服务器返回的不是有效的 JSON"
-        except Exception as e:
-            return False, f"请求失败: {str(e)}"
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    url, data=body.encode('utf-8'), headers=headers, method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode('utf-8'))
+                    content = result['choices'][0]['message']['content']
+                    return True, content
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8', errors='replace')
+                if e.code == 429 and attempt < max_retries:
+                    # 速率限制，等待后重试
+                    import time
+                    time.sleep(5 * (attempt + 1))
+                    last_error = f"HTTP 429 速率限制，正在重试 ({attempt+1}/{max_retries})"
+                    continue
+                return False, f"HTTP 错误 {e.code}: {error_body}"
+            except urllib.error.URLError as e:
+                if attempt < max_retries:
+                    import time
+                    time.sleep(3 * (attempt + 1))
+                    last_error = f"连接失败，正在重试 ({attempt+1}/{max_retries})"
+                    continue
+                return False, f"连接错误: {e.reason}\n请检查 URL 是否正确，服务是否已启动"
+            except json.JSONDecodeError:
+                return False, "响应解析失败：服务器返回的不是有效的 JSON"
+            except Exception as e:
+                error_str = str(e)
+                # 超时错误可以重试
+                if ('timeout' in error_str.lower() or 'timed out' in error_str.lower()) and attempt < max_retries:
+                    import time
+                    time.sleep(3 * (attempt + 1))
+                    last_error = f"请求超时，正在重试 ({attempt+1}/{max_retries})"
+                    continue
+                return False, f"请求失败: {error_str}"
+
+        return False, last_error or "所有重试均失败"
 
     def test_connection(self) -> tuple:
         """测试 LLM 连接"""
@@ -164,62 +193,74 @@ class LLMService:
         return self.call_llm(prompt, system_prompt)
 
     def generate_code_from_document(self, document_content: str, header_content: str) -> tuple:
-        """基于需求文档和头文件通过 LLM 生成代码"""
+        """基于需求文档和头文件通过 LLM 生成代码（直接路径，跳过映射文档）"""
         system_prompt = (
-            "你是一个专业的嵌入式 C 语言代码生成器。根据提供的需求文档和头文件结构体定义，"
-            "生成符合文档要求的数据转换代码。要求：\n"
-            "1. 严格按照文档描述的逻辑实现数据转换\n"
-            "2. 包含必要的类型转换和错误处理\n"
-            "3. 添加清晰的中文注释，说明每一步对应的文档要求\n"
-            "4. 遵循下方的编码规范\n"
+            "你是一个专业的嵌入式 C 语言代码生成器。根据提供的需求文档（通常是中文）和头文件结构体定义，"
+            "直接生成数据转换代码。\n\n"
+            "## 关键能力：语义匹配\n"
+            "需求文档中的中文描述需要与头文件注释进行语义匹配：\n"
+            "1. 阅读头文件中的字段注释（// 或 /* */）来理解每个字段的含义\n"
+            "2. 将文档中的中文描述与注释进行语义匹配，找到对应的 C 字段名\n"
+            "3. 例如：文档说「温度从放大100倍的整数转为浮点」\n"
+            "   → 头文件有 `int32_t temperature_x100; // 温度 * 100`\n"
+            "   → 生成: dst->temperature = (float)src->temperature_x100 * 0.01f;\n\n"
+            "## 输出要求\n"
+            "1. 直接生成可编译的 C 代码，不需要中间步骤\n"
+            "2. 每个结构体对一个转换函数: int convert_X_to_Y(const X *src, Y *dst)\n"
+            "3. 包含 NULL 指针检查，成功返回 0，失败返回 -1\n"
+            "4. 每行代码旁边用中文注释说明对应的文档需求\n"
             "5. 只输出 C 代码，用 ```c ``` 包裹\n"
             "6. 不要输出多余的解释"
             + self._get_standard_suffix()
         )
 
         prompt = (
-            f"请根据以下需求文档和头文件，生成数据转换代码：\n\n"
+            f"请根据以下中文需求文档和头文件，直接生成数据转换代码。\n"
+            f"注意：用头文件中的注释来理解字段含义，与文档中的中文描述进行语义匹配。\n\n"
             f"## 头文件内容：\n```c\n{header_content}\n```\n\n"
             f"## 需求文档：\n{document_content}\n\n"
-            f"请分析文档中的数据转换需求，结合头文件中的结构体定义，生成完整的 C 语言转换代码。"
+            f"请直接生成完整的 C 转换函数代码，不需要输出映射文档。"
         )
         return self.call_llm(prompt, system_prompt)
 
     def convert_doc_to_mapping_doc(self, natural_doc: str, header_content: str) -> tuple:
         """将自然语言文档转换为规范映射文档
 
-        Args:
-            natural_doc: 自然语言需求文档内容
-            header_content: 头文件内容
-
-        Returns:
-            (success: bool, mapping_doc: str)
+        支持中文自由格式描述，通过语义匹配头文件中的字段名和注释。
         """
         system_prompt = (
-            "你是一个专业的数据映射文档转换器。你的任务是将自然语言描述的数据转换需求文档，"
+            "你是一个专业的数据映射文档转换器。你的任务是将自然语言（通常是中文）描述的数据转换需求，"
             "结合C语言头文件中的结构体定义，转换为标准格式的映射关系文档。\n\n"
-            "标准映射文档格式如下：\n"
+            "## 关键能力：语义匹配\n"
+            "需求文档中的中文描述可能不是直接的字段名，而是语义描述。你需要：\n"
+            "1. 阅读头文件中的字段注释（// 或 /* */ 中的中文说明）\n"
+            "2. 将需求文档中的中文描述与头文件注释进行语义匹配\n"
+            "3. 例如：文档说「温度」→ 头文件有 `int32_t temperature_x100; // 温度 * 100` → 匹配到 temperature_x100\n"
+            "4. 例如：文档说「采样间隔」→ 头文件有 `uint16_t sampling_rate_ms; // 采样率(毫秒)` → 匹配到 sampling_rate_ms\n"
+            "5. 即使描述不完全一致，也要根据上下文推断最可能的对应关系\n\n"
+            "## 输出格式\n"
+            "```markdown\n"
             "# 数据映射关系文档\n\n"
-            "## 变量定义\n"
-            "### 源变量\n"
-            "- var_name : type\n"
-            "  - member_name : member_type  (如果是结构体)\n\n"
-            "### 目标变量\n"
-            "- var_name : type\n\n"
             "## 映射关系\n"
-            "source_member -> target_member [操作类型]\n"
-            "source_member -> target_member [操作类型] {条件表达式}\n\n"
-            "操作类型包括: 直接赋值, 类型转换, 缩放, 偏移, 自定义\n"
-            "条件表达式格式: var_ref operator value\n\n"
-            "请严格按照上述格式输出映射关系文档，不要添加多余的解释。"
+            "| 源字段 | 目标字段 | 转换规则 | 业务含义 |\n"
+            "|--------|----------|----------|----------|\n"
+            "| source_field | target_field | 类型转换/缩放/偏移/直接赋值 | 对应的中文说明 |\n"
+            "```\n\n"
+            "转换规则分类：\n"
+            "- 直接赋值：类型和值都不变\n"
+            "- 类型转换：值不变但类型变了（如 uint16→uint32）\n"
+            "- 缩放：值需要乘或除一个系数（如 ×1000, ÷100）\n"
+            "- 偏移：值需要加减一个常量\n"
+            "- 自定义：其他复杂转换逻辑\n\n"
+            "请严格按照上述格式输出，不要添加多余的解释。"
         )
 
         prompt = (
-            f"请将以下自然语言需求文档转换为标准格式的映射关系文档：\n\n"
+            f"请将以下中文需求文档转换为标准映射文档。\n"
+            f"注意：文档中的中文描述需要与头文件注释进行语义匹配来找到对应的 C 字段名。\n\n"
             f"## 头文件内容：\n```c\n{header_content}\n```\n\n"
             f"## 需求文档：\n{natural_doc}\n\n"
-            f"请分析需求文档中的数据转换需求，结合头文件中的结构体定义，"
-            f"生成标准格式的映射关系文档。只输出映射文档内容。"
+            f"请逐条分析需求文档中的转换说明，与头文件字段进行语义匹配，生成映射文档。"
         )
 
         return self.call_llm(prompt, system_prompt)
@@ -1530,6 +1571,8 @@ class ExternMapperApp:
         ai_row.pack(fill=tk.X, pady=(5, 0))
         ttk.Button(ai_row, text="🤖 AI: 文档 → 映射文档",
                    command=self._simple_ai_doc_to_mapping, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(ai_row, text="⚡ AI: 文档 → 直接生成代码",
+                   command=self._simple_ai_doc_direct_to_code, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
         self.simple_llm_status = tk.StringVar(value="")
         ttk.Label(ai_row, textvariable=self.simple_llm_status, style='Info.TLabel').pack(
             side=tk.LEFT, padx=(15, 0))
@@ -1882,6 +1925,56 @@ class ExternMapperApp:
                 self.simple_code_text.delete('1.0', tk.END)
                 self.simple_code_text.insert('1.0', f"/* 生成失败: {result} */")
             self.status_var.set("❌ AI 生成代码失败")
+
+    def _simple_ai_doc_direct_to_code(self):
+        """AI: 需求文档 → 直接生成 C 代码（跳过映射文档，省 token 省时间）"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "LLM 服务未配置！请检查 miapikey.txt 文件。")
+            return
+
+        if not self.doc_content:
+            messagebox.showwarning("警告", "请先加载需求文档！")
+            return
+
+        self.status_var.set("⚡ AI 正在从文档直接生成代码（跳过映射文档）...")
+        self.root.update_idletasks()
+
+        def call_llm():
+            # 合并所有头文件内容
+            all_headers = self.header_content or ""
+            if self.target_header_content:
+                all_headers += "\n\n" + self.target_header_content
+
+            success, result = self.llm_service.generate_code_from_document(
+                self.doc_content, all_headers
+            )
+            self.root.after(0, lambda: self._on_direct_code_result(success, result))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+
+    def _on_direct_code_result(self, success: bool, result: str):
+        """AI 直接生成代码的回调"""
+        if success:
+            code = self._extract_code_from_llm_response(result)
+            if hasattr(self, 'simple_code_text'):
+                self.simple_code_text.delete('1.0', tk.END)
+                self.simple_code_text.insert('1.0', code)
+
+            # 同时在映射文档区显示简要说明
+            if hasattr(self, 'simple_mapping_text'):
+                self.simple_mapping_text.delete('1.0', tk.END)
+                self.simple_mapping_text.insert('1.0',
+                    "/* ⚡ 直接生成模式：已跳过映射文档，直接从需求文档生成代码 */\n"
+                    "/* 如需查看映射关系，请使用「AI: 文档 → 映射文档」按钮 */"
+                )
+
+            self.status_var.set("⚡ AI 已直接从文档生成代码（跳过映射文档）")
+        else:
+            if hasattr(self, 'simple_code_text'):
+                self.simple_code_text.delete('1.0', tk.END)
+                self.simple_code_text.insert('1.0', f"/* 生成失败: {result} */")
+            self.status_var.set("❌ AI 直接生成代码失败")
 
     def _simple_local_mapping_to_code(self):
         """本地: 映射文档 → C 代码"""

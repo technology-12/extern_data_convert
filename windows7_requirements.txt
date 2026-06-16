@@ -3,14 +3,27 @@
 pandas==1.4.4  # Compatible with Python 3.8 and Windows 7
 openpyxl==3.0.10
 
+# Optional: for reading .docx documents in v3.0 document-driven code generation
+# Not required for core LLM/AI features - those use only Python standard library
+python-docx==0.8.11
+
 # These versions are known to work with Python 3.8 and Windows 7
 # You can download the appropriate .whl files from:
 # https://pypi.org/project/pandas/1.4.4/#files
 # https://pypi.org/project/openpyxl/3.0.10/#files
+# https://pypi.org/project/python-docx/0.8.11/#files
 
 # Look for files with these patterns:
 # For pandas: pandas-1.4.4-*.whl (choose based on your architecture - win32 or win_amd64)
 # For openpyxl: openpyxl-3.0.10-py2.py3-none-any.whl (this one is architecture-independent)
+# For python-docx: python_docx-0.8.11-py2.py3-none-any.whl (architecture-independent)
 
 # Note: pandas 1.4.4 should work on Windows 7 with Python 3.8.10
 # However, if you encounter issues, try the earlier version pandas==1.3.5
+
+# v3.0 Note: The LLM service and local document generator use ONLY Python standard
+# library (urllib, json, threading, re). No additional packages are needed for:
+#   - LLM API connection and code generation
+#   - Local document rule parsing and code generation
+#   - Loading .txt, .md, .csv documents
+# Only python-docx is needed if you want to load .docx Word documents.

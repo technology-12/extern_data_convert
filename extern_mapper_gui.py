@@ -3,6 +3,12 @@ Extern 变量映射工具 - GUI 主程序
 基于 tkinter 的可视化工具，用于读取头文件中的 extern 变量，
 并允许用户将 extern 变量的成员与自定义变量进行对应赋值和逻辑判断。
 
+功能:
+    1. 结构体用户变量简化操作 - 从已解析的结构体类型快速添加变量
+    2. 目标头文件支持 - 选择另一个头文件，使用其中的变量作为映射目标
+    3. Markdown 文档生成 - 生成清晰的变量映射关系文档，方便大模型生成代码
+    4. 条件表达式与/或操作 - 支持多条件组合的有效性判断
+
 启动方式:
     python extern_mapper_gui.py
 """
@@ -12,54 +18,1448 @@ import os
 import sys
 import json
 import re
+import threading
+import urllib.request
+import urllib.error
 from typing import Dict, List, Any, Optional
+from datetime import datetime
 
-# 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.header_parser import HeaderParser
 
 
+class LLMService:
+    """LLM API 服务类 - 支持连接 OpenAI 兼容的 LLM 模型服务"""
+
+    def __init__(self, api_key: str = "", base_url: str = "", model: str = ""):
+        # 优先从 miapikey.txt 自动加载配置
+        config = self._load_config_from_file()
+        self.api_key = api_key or config.get('api_key', '')
+        self.base_url = (base_url or config.get('base_url', '')).rstrip('/')
+        self.model = model or config.get('model', '')
+        self._coding_standard = self._load_coding_standard()
+
+    @staticmethod
+    def _load_config_from_file() -> dict:
+        """从 miapikey.txt 加载配置（3行格式: key, url, model）"""
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'miapikey.txt')
+        config = {}
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                if len(lines) >= 1:
+                    config['api_key'] = lines[0]
+                if len(lines) >= 2:
+                    config['base_url'] = lines[1]
+                if len(lines) >= 3:
+                    config['model'] = lines[2]
+        except Exception:
+            pass
+        return config
+
+    @staticmethod
+    def _load_coding_standard() -> str:
+        """加载编码规范文档"""
+        standard_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'coding_standard.md'
+        )
+        try:
+            if os.path.exists(standard_path):
+                with open(standard_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+        except Exception:
+            pass
+        return ""
+
+    def _get_standard_suffix(self) -> str:
+        """获取编码规范提示后缀，用于注入到 system_prompt"""
+        if not self._coding_standard:
+            return ""
+        return (
+            "\n\n## 强制编码规范\n"
+            "你生成的所有代码必须严格遵守以下编码规范，违反任何一条视为失败：\n\n"
+            f"{self._coding_standard}\n\n"
+            "请在生成代码时逐条对照上述规范。"
+        )
+
+    def is_configured(self) -> bool:
+        """检查是否已配置"""
+        return bool(self.base_url and self.model)
+
+    def call_llm(self, prompt: str, system_prompt: str = "") -> tuple:
+        """调用 LLM API
+
+        Returns:
+            (success: bool, response_text: str)
+        """
+        if not self.is_configured():
+            return False, "LLM 服务未配置，请先在「AI 助手」菜单中设置 API Key 和 URL"
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        body = json.dumps({
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 8192,
+        })
+
+        try:
+            req = urllib.request.Request(
+                url, data=body.encode('utf-8'), headers=headers, method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                content = result['choices'][0]['message']['content']
+                return True, content
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8', errors='replace')
+            return False, f"HTTP 错误 {e.code}: {error_body}"
+        except urllib.error.URLError as e:
+            return False, f"连接错误: {e.reason}\n请检查 URL 是否正确，服务是否已启动"
+        except json.JSONDecodeError:
+            return False, "响应解析失败：服务器返回的不是有效的 JSON"
+        except Exception as e:
+            return False, f"请求失败: {str(e)}"
+
+    def test_connection(self) -> tuple:
+        """测试 LLM 连接"""
+        return self.call_llm(
+            "Hello, 请用一句话回复「连接成功」。",
+            "你是一个测试助手，请简短回复。"
+        )
+
+    def generate_code_from_mapping(self, mapping_info: str, header_content: str) -> tuple:
+        """基于映射信息通过 LLM 生成代码"""
+        system_prompt = (
+            "你是一个专业的嵌入式 C 语言代码生成器。根据提供的头文件内容和变量映射关系，"
+            "生成高质量的 C 语言数据转换代码。要求：\n"
+            "1. 包含必要的类型转换\n"
+            "2. 处理 NULL 指针检查\n"
+            "3. 添加清晰的中文注释\n"
+            "4. 遵循下方的编码规范\n"
+            "5. 只输出 C 代码，用 ```c ``` 包裹\n"
+            "6. 不要输出多余的解释"
+            + self._get_standard_suffix()
+        )
+
+        prompt = (
+            f"请根据以下信息生成 C 语言数据转换代码：\n\n"
+            f"## 头文件内容：\n```c\n{header_content}\n```\n\n"
+            f"## 变量映射关系：\n{mapping_info}\n\n"
+            f"请生成完整的转换函数代码。"
+        )
+
+        return self.call_llm(prompt, system_prompt)
+
+    def generate_code_from_document(self, document_content: str, header_content: str) -> tuple:
+        """基于需求文档和头文件通过 LLM 生成代码"""
+        system_prompt = (
+            "你是一个专业的嵌入式 C 语言代码生成器。根据提供的需求文档和头文件结构体定义，"
+            "生成符合文档要求的数据转换代码。要求：\n"
+            "1. 严格按照文档描述的逻辑实现数据转换\n"
+            "2. 包含必要的类型转换和错误处理\n"
+            "3. 添加清晰的中文注释，说明每一步对应的文档要求\n"
+            "4. 遵循下方的编码规范\n"
+            "5. 只输出 C 代码，用 ```c ``` 包裹\n"
+            "6. 不要输出多余的解释"
+            + self._get_standard_suffix()
+        )
+
+        prompt = (
+            f"请根据以下需求文档和头文件，生成数据转换代码：\n\n"
+            f"## 头文件内容：\n```c\n{header_content}\n```\n\n"
+            f"## 需求文档：\n{document_content}\n\n"
+            f"请分析文档中的数据转换需求，结合头文件中的结构体定义，生成完整的 C 语言转换代码。"
+        )
+        return self.call_llm(prompt, system_prompt)
+
+    def convert_doc_to_mapping_doc(self, natural_doc: str, header_content: str) -> tuple:
+        """将自然语言文档转换为规范映射文档
+
+        Args:
+            natural_doc: 自然语言需求文档内容
+            header_content: 头文件内容
+
+        Returns:
+            (success: bool, mapping_doc: str)
+        """
+        system_prompt = (
+            "你是一个专业的数据映射文档转换器。你的任务是将自然语言描述的数据转换需求文档，"
+            "结合C语言头文件中的结构体定义，转换为标准格式的映射关系文档。\n\n"
+            "标准映射文档格式如下：\n"
+            "# 数据映射关系文档\n\n"
+            "## 变量定义\n"
+            "### 源变量\n"
+            "- var_name : type\n"
+            "  - member_name : member_type  (如果是结构体)\n\n"
+            "### 目标变量\n"
+            "- var_name : type\n\n"
+            "## 映射关系\n"
+            "source_member -> target_member [操作类型]\n"
+            "source_member -> target_member [操作类型] {条件表达式}\n\n"
+            "操作类型包括: 直接赋值, 类型转换, 缩放, 偏移, 自定义\n"
+            "条件表达式格式: var_ref operator value\n\n"
+            "请严格按照上述格式输出映射关系文档，不要添加多余的解释。"
+        )
+
+        prompt = (
+            f"请将以下自然语言需求文档转换为标准格式的映射关系文档：\n\n"
+            f"## 头文件内容：\n```c\n{header_content}\n```\n\n"
+            f"## 需求文档：\n{natural_doc}\n\n"
+            f"请分析需求文档中的数据转换需求，结合头文件中的结构体定义，"
+            f"生成标准格式的映射关系文档。只输出映射文档内容。"
+        )
+
+        return self.call_llm(prompt, system_prompt)
+
+    def generate_code_from_mapping_doc(self, mapping_doc: str, header_content: str) -> tuple:
+        """基于规范映射文档生成代码
+
+        Args:
+            mapping_doc: 规范映射关系文档
+            header_content: 头文件内容
+
+        Returns:
+            (success: bool, code: str)
+        """
+        system_prompt = (
+            "你是一个专业的嵌入式 C 语言代码生成器。根据提供的标准映射关系文档和头文件内容，"
+            "生成高质量的 C 语言数据转换代码。要求：\n"
+            "1. 严格按照映射文档中的规则实现数据转换\n"
+            "2. 包含必要的类型转换和 NULL 指针检查\n"
+            "3. 添加清晰的中文注释，说明每条映射规则的实现\n"
+            "4. 遵循下方的编码规范\n"
+            "5. 只输出 C 代码，用 ```c ``` 包裹\n"
+            "6. 不要输出多余的解释"
+            + self._get_standard_suffix()
+        )
+
+        prompt = (
+            f"请根据以下标准映射关系文档和头文件，生成数据转换代码：\n\n"
+            f"## 头文件内容：\n```c\n{header_content}\n```\n\n"
+            f"## 映射关系文档：\n{mapping_doc}\n\n"
+            f"请严格按照映射文档中定义的规则，生成完整的 C 语言转换函数代码。"
+        )
+
+        return self.call_llm(prompt, system_prompt)
+
+
+class DocumentBasedGenerator:
+    """基于文档的本地代码生成器 - 通过 Python 解析文档规则生成 C 语言代码"""
+
+    def __init__(self, parser=None, target_parser=None):
+        self.parser = parser
+        self.target_parser = target_parser
+
+    def parse_document_rules(self, doc_content: str) -> List[Dict]:
+        """从文档内容中解析映射规则
+
+        支持的格式:
+            source_member -> target_member [转换类型]
+            source_member => target_member [转换类型]
+            source_member = target_member
+            source_member : target_member
+        """
+        rules = []
+        lines = doc_content.strip().split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+
+            rule = self._parse_rule_line(line)
+            if rule:
+                rules.append(rule)
+
+        return rules
+
+    def _parse_rule_line(self, line: str) -> Optional[Dict]:
+        """解析单行映射规则"""
+        for sep in ['->', '=>', '=', ':']:
+            if sep in line:
+                parts = line.split(sep, 1)
+                if len(parts) == 2:
+                    source = parts[0].strip()
+                    target_part = parts[1].strip()
+
+                    # 解析转换类型 [xxx]
+                    conv_type = '直接赋值'
+                    if '[' in target_part and ']' in target_part:
+                        idx_start = target_part.index('[')
+                        idx_end = target_part.index(']')
+                        conv_type = target_part[idx_start + 1:idx_end].strip()
+                        target_part = target_part[:idx_start].strip()
+
+                    # 解析条件 {xxx}
+                    condition = ''
+                    if '{' in target_part and '}' in target_part:
+                        idx_start = target_part.index('{')
+                        idx_end = target_part.index('}')
+                        condition = target_part[idx_start + 1:idx_end].strip()
+                        target_part = target_part[:idx_start].strip()
+
+                    if source and target_part:
+                        return {
+                            'source': source,
+                            'target': target_part,
+                            'conversion': conv_type,
+                            'condition': condition,
+                        }
+        return None
+
+    def generate_code(self, doc_content: str, header_content: str = "",
+                      source_structs: Dict = None, target_structs: Dict = None) -> str:
+        """基于文档内容本地生成 C 代码"""
+        rules = self.parse_document_rules(doc_content)
+
+        if not rules:
+            return (
+                "/* 未能从文档中解析出有效的映射规则 */\n"
+                "/* 支持的格式: */\n"
+                "/*   source_member -> target_member [转换类型] {条件} */\n"
+                "/*   source_member => target_member */\n"
+                "/*   source_member = target_member */\n"
+                "/*   source_member : target_member */\n"
+            )
+
+        lines = []
+        lines.append("/*")
+        lines.append(" * 基于需求文档自动生成的数据转换代码")
+        lines.append(f" * 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f" * 解析到 {len(rules)} 条映射规则")
+        lines.append(" */")
+        lines.append("")
+
+        # 收集所有涉及的源和目标变量
+        source_vars = set()
+        target_vars = set()
+        for rule in rules:
+            source_vars.add(rule['source'].split('.')[0].split('->')[0])
+            target_vars.add(rule['target'].split('.')[0].split('->')[0])
+
+        # 生成函数
+        func_name = "document_based_convert"
+        params = []
+        for sv in sorted(source_vars):
+            params.append(f"const void *{sv}")
+        for tv in sorted(target_vars):
+            params.append(f"void *{tv}")
+
+        lines.append(f"void {func_name}({', '.join(params)}) {{")
+
+        for i, rule in enumerate(rules, 1):
+            source = rule['source']
+            target = rule['target']
+            conv = rule['conversion']
+            cond = rule.get('condition', '')
+
+            lines.append(f"    /* 规则 {i}: {source} -> {target} [{conv}] */")
+
+            # 处理条件
+            if cond:
+                lines.append(f"    if ({cond}) {{")
+
+            # 根据转换类型生成代码
+            if conv == '直接赋值':
+                stmt = f"{target} = {source};"
+            elif conv == '类型转换':
+                target_type = self._infer_type(target)
+                stmt = f"{target} = ({target_type}){source};"
+            elif conv.startswith('*') or conv.startswith('×') or conv.startswith('缩放'):
+                factor = re.sub(r'^[*×缩放\s]+', '', conv).strip()
+                if not factor:
+                    factor = '1.0'
+                stmt = f"{target} = {source} * {factor};"
+            elif conv.startswith('+') or conv.startswith('偏移'):
+                offset = re.sub(r'^[+偏移\s]+', '', conv).strip()
+                if not offset:
+                    offset = '0'
+                stmt = f"{target} = {source} + {offset};"
+            elif conv.startswith('自定义') or conv.startswith('custom'):
+                stmt = f"{target} = {source};  /* TODO: 自定义转换 */"
+            else:
+                stmt = f"{target} = {source};  /* {conv} */"
+
+            if cond:
+                lines.append(f"        {stmt}")
+                lines.append(f"    }}")
+            else:
+                lines.append(f"    {stmt}")
+            lines.append("")
+
+        lines.append("}")
+
+        return "\n".join(lines)
+
+    def _infer_type(self, var_name: str) -> str:
+        """根据变量名推断类型"""
+        name_lower = var_name.lower()
+        if any(kw in name_lower for kw in ['temp', 'temperature', 'voltage', 'current', 'pressure']):
+            return 'float'
+        if any(kw in name_lower for kw in ['flag', 'enable', 'status', 'active']):
+            return 'uint8_t'
+        if any(kw in name_lower for kw in ['count', 'num', 'index', 'id']):
+            return 'uint32_t'
+        if any(kw in name_lower for kw in ['name', 'str', 'desc']):
+            return 'char *'
+        return 'int'
+
+    def parse_mappings_from_document(self, doc_content: str) -> tuple:
+        """从文档内容解析映射关系，返回 (user_vars, mappings)
+
+        支持的文档格式:
+        1. 表格格式（Markdown 表格）
+        2. 行格式: 源成员 -> 目标成员 [操作类型] {条件}
+        3. 中文格式: 源成员 映射到 目标成员
+        4. 带变量定义的格式
+
+        Returns:
+            (user_vars: List[Dict], mappings: List[Dict])
+        """
+        user_vars = []
+        mappings = []
+        lines = doc_content.strip().split('\n')
+
+        # 先解析变量定义区（## 变量定义 或 ## 用户变量 之后的段落）
+        in_var_section = False
+        in_mapping_section = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # 检测章节标题
+            if stripped.startswith('##') or stripped.startswith('#'):
+                lower = stripped.lower()
+                if any(kw in lower for kw in ['变量定义', '用户变量', '变量列表', '变量声明', 'variable']):
+                    in_var_section = True
+                    in_mapping_section = False
+                    continue
+                elif any(kw in lower for kw in ['映射', '映射关系', '映射规则', 'mapping']):
+                    in_var_section = False
+                    in_mapping_section = True
+                    continue
+                else:
+                    in_var_section = False
+                    in_mapping_section = False
+                    continue
+
+            # 解析变量定义
+            if in_var_section:
+                var_info = self._parse_var_definition(stripped)
+                if var_info and not any(v['name'] == var_info['name'] for v in user_vars):
+                    user_vars.append(var_info)
+
+            # 解析映射关系
+            if in_mapping_section or (not in_var_section and not in_mapping_section):
+                mapping = self._parse_mapping_line(stripped)
+                if mapping:
+                    mappings.append(mapping)
+
+        # 如果没有通过章节解析到内容，尝试全文解析
+        if not mappings:
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#') or stripped.startswith('//'):
+                    continue
+                # 跳过表格分隔行
+                if set(stripped) <= set('-| :'):
+                    continue
+                mapping = self._parse_mapping_line(stripped)
+                if mapping:
+                    mappings.append(mapping)
+
+        # 尝试解析 Markdown 表格
+        if not mappings:
+            mappings = self._parse_markdown_table(lines)
+
+        # 从映射关系中提取隐含的用户变量
+        for m in mappings:
+            target = m['user_var']
+            if not any(v['name'] == target for v in user_vars):
+                user_vars.append({
+                    'name': target,
+                    'type': self._infer_type(target),
+                    'desc': f'从文档导入',
+                    'source': '文档导入',
+                    'is_struct': False,
+                })
+
+        return user_vars, mappings
+
+    def _parse_var_definition(self, line: str) -> Optional[Dict]:
+        """解析变量定义行
+
+        支持格式:
+        - 变量名 类型
+        - 类型 变量名
+        - 变量名: 类型
+        - 变量名 (类型)
+        - | 变量名 | 类型 | 描述 |  (表格行)
+        """
+        if not line or line.startswith('#') or line.startswith('//'):
+            return None
+
+        # 表格行格式: | name | type | desc |
+        if '|' in line:
+            cells = [c.strip() for c in line.split('|')]
+            cells = [c for c in cells if c]
+            if len(cells) >= 2:
+                name = cells[0].strip()
+                type_str = cells[1].strip()
+                desc = cells[2].strip() if len(cells) > 2 else ''
+                # 跳过表头
+                if name in ('变量名', '名称', 'name', 'Name', '---', '变量'):
+                    return None
+                if type_str in ('类型', 'type', 'Type', '---'):
+                    return None
+                if name and type_str and not name.startswith('-'):
+                    return {
+                        'name': name,
+                        'type': type_str,
+                        'desc': desc,
+                        'source': '文档导入',
+                        'is_struct': False,
+                    }
+            return None
+
+        # 冒号格式: 变量名: 类型
+        if ':' in line:
+            parts = line.split(':', 1)
+            name = parts[0].strip()
+            rest = parts[1].strip()
+            # 提取类型和描述
+            type_parts = rest.split(None, 1)
+            type_str = type_parts[0] if type_parts else 'int'
+            desc = type_parts[1] if len(type_parts) > 1 else ''
+            if name and not name.startswith('#'):
+                return {
+                    'name': name,
+                    'type': type_str,
+                    'desc': desc,
+                    'source': '文档导入',
+                    'is_struct': False,
+                }
+
+        # 括号格式: 变量名 (类型)
+        m = re.match(r'(\w+)\s*[\(（](\w+)[\)）]\s*(.*)', line)
+        if m:
+            return {
+                'name': m.group(1),
+                'type': m.group(2),
+                'desc': m.group(3).strip(),
+                'source': '文档导入',
+                'is_struct': False,
+            }
+
+        # 空格分隔: 类型 变量名 或 变量名 类型
+        parts = line.split()
+        if len(parts) >= 2:
+            first, second = parts[0], parts[1]
+            c_types = {'int', 'float', 'double', 'char', 'short', 'long', 'void',
+                       'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+                       'int8_t', 'int16_t', 'int32_t', 'int64_t',
+                       'bool', 'unsigned', 'signed', 'struct'}
+            if first in c_types:
+                return {
+                    'name': second,
+                    'type': first,
+                    'desc': ' '.join(parts[2:]) if len(parts) > 2 else '',
+                    'source': '文档导入',
+                    'is_struct': False,
+                }
+            if second in c_types:
+                return {
+                    'name': first,
+                    'type': second,
+                    'desc': ' '.join(parts[2:]) if len(parts) > 2 else '',
+                    'source': '文档导入',
+                    'is_struct': False,
+                }
+
+        return None
+
+    def _parse_mapping_line(self, line: str) -> Optional[Dict]:
+        """解析映射关系行
+
+        支持格式:
+        - source -> target
+        - source => target
+        - source = target
+        - source : target
+        - source 映射到 target
+        - source 映射 target
+        - source 赋值给 target
+        - source 对应 target
+        - | source | target | 操作 | 转换 | 条件 | (表格行)
+        """
+        if not line or line.startswith('#') or line.startswith('//'):
+            return None
+
+        # 表格行
+        if '|' in line:
+            cells = [c.strip() for c in line.split('|')]
+            cells = [c for c in cells if c]
+            if len(cells) >= 2:
+                source = cells[0].strip()
+                target = cells[1].strip()
+                # 跳过表头
+                if source in ('源', '源成员', 'source', 'Source', '---', 'extern'):
+                    return None
+                if target in ('目标', '目标成员', 'target', 'Target', '---'):
+                    return None
+                if source.startswith('-') or target.startswith('-'):
+                    return None
+                op_type = cells[2].strip() if len(cells) > 2 else '直接赋值'
+                conv = cells[3].strip() if len(cells) > 3 else '='
+                cond_str = cells[4].strip() if len(cells) > 4 else ''
+
+                if source and target:
+                    # 规范化操作类型
+                    op_type = self._normalize_op_type(op_type)
+                    conv_rule = self._normalize_conv(conv)
+
+                    conditions = []
+                    if cond_str:
+                        conditions = self._parse_condition_string(cond_str)
+
+                    return {
+                        'extern_member': source,
+                        'user_var': target,
+                        'op_type': op_type,
+                        'condition': conditions,
+                        'conversion': conv_rule,
+                        'conv_rule': conv_rule,
+                    }
+            return None
+
+        # 中文关键词格式
+        for kw in ['映射到', '赋值给', '对应', '映射']:
+            if kw in line:
+                parts = line.split(kw, 1)
+                if len(parts) == 2:
+                    source = parts[0].strip()
+                    rest = parts[1].strip()
+                    # 解析可选的 [操作类型] 和 {条件}
+                    op_type = '直接赋值'
+                    conv_rule = '='
+                    conditions = []
+
+                    if '[' in rest and ']' in rest:
+                        idx_s = rest.index('[')
+                        idx_e = rest.index(']')
+                        op_str = rest[idx_s + 1:idx_e].strip()
+                        op_type = self._normalize_op_type(op_str)
+                        rest = rest[:idx_s].strip() + rest[idx_e + 1:].strip()
+
+                    if '{' in rest and '}' in rest:
+                        idx_s = rest.index('{')
+                        idx_e = rest.index('}')
+                        cond_str = rest[idx_s + 1:idx_e].strip()
+                        conditions = self._parse_condition_string(cond_str)
+                        rest = rest[:idx_s].strip() + rest[idx_e + 1:].strip()
+
+                    target = rest.strip()
+                    if source and target:
+                        return {
+                            'extern_member': source,
+                            'user_var': target,
+                            'op_type': op_type,
+                            'condition': conditions,
+                            'conversion': conv_rule,
+                            'conv_rule': conv_rule,
+                        }
+
+        # 标准分隔符格式
+        for sep in ['->', '=>', '=', ':']:
+            if sep in line:
+                parts = line.split(sep, 1)
+                if len(parts) == 2:
+                    source = parts[0].strip()
+                    rest = parts[1].strip()
+
+                    op_type = '直接赋值'
+                    conv_rule = '='
+                    conditions = []
+
+                    if '[' in rest and ']' in rest:
+                        idx_s = rest.index('[')
+                        idx_e = rest.index(']')
+                        op_str = rest[idx_s + 1:idx_e].strip()
+                        op_type = self._normalize_op_type(op_str)
+                        conv_rule = self._normalize_conv(op_str)
+                        rest = rest[:idx_s].strip() + rest[idx_e + 1:].strip()
+
+                    if '{' in rest and '}' in rest:
+                        idx_s = rest.index('{')
+                        idx_e = rest.index('}')
+                        cond_str = rest[idx_s + 1:idx_e].strip()
+                        conditions = self._parse_condition_string(cond_str)
+                        rest = rest[:idx_s].strip() + rest[idx_e + 1:].strip()
+
+                    target = rest.strip()
+                    if source and target:
+                        return {
+                            'extern_member': source,
+                            'user_var': target,
+                            'op_type': op_type,
+                            'condition': conditions,
+                            'conversion': conv_rule,
+                            'conv_rule': conv_rule,
+                        }
+                break
+
+        return None
+
+    def _parse_markdown_table(self, lines: List[str]) -> List[Dict]:
+        """解析 Markdown 表格格式的映射关系"""
+        mappings = []
+        table_lines = []
+        in_table = False
+
+        for line in lines:
+            stripped = line.strip()
+            if '|' in stripped:
+                in_table = True
+                table_lines.append(stripped)
+            elif in_table:
+                break
+
+        if len(table_lines) < 2:
+            return []
+
+        for line in table_lines:
+            mapping = self._parse_mapping_line(line)
+            if mapping:
+                mappings.append(mapping)
+
+        return mappings
+
+    def _normalize_op_type(self, op_str: str) -> str:
+        """规范化操作类型"""
+        op_str = op_str.strip()
+        op_map = {
+            '直接赋值': '直接赋值', '赋值': '直接赋值', '=': '直接赋值',
+            '条件赋值': '条件赋值', '条件': '条件赋值', 'if': '条件赋值',
+            '逻辑判断': '逻辑判断', '判断': '逻辑判断', 'check': '逻辑判断',
+            '自定义': '自定义表达式', '自定义表达式': '自定义表达式', 'custom': '自定义表达式',
+        }
+        return op_map.get(op_str, '直接赋值')
+
+    def _normalize_conv(self, conv_str: str) -> str:
+        """规范化转换规则"""
+        conv_str = conv_str.strip()
+        if not conv_str or conv_str == '=' or conv_str == '直接赋值':
+            return '='
+        if conv_str.startswith('('):
+            return conv_str
+        if conv_str.startswith('*') or conv_str.startswith('×'):
+            return conv_str
+        if conv_str.startswith('+'):
+            return conv_str
+        return conv_str
+
+    def _parse_condition_string(self, cond_str: str) -> List[Dict]:
+        """解析条件字符串为条件列表
+
+        格式: 变量 操作符 值 [AND/OR 变量 操作符 值 ...]
+        例如: temperature > 50 AND status == 1
+        """
+        conditions = []
+        # 按 AND/OR 分割
+        parts = re.split(r'\s+(AND|OR|且|或|并且|或者)\s+', cond_str)
+
+        i = 0
+        while i < len(parts):
+            part = parts[i].strip()
+            logic = 'AND'
+
+            if i + 1 < len(parts) and parts[i + 1].strip() in ('AND', 'OR', '且', '并且', '或', '或者'):
+                logic_word = parts[i + 1].strip()
+                logic = 'OR' if logic_word in ('OR', '或', '或者') else 'AND'
+                i += 2
+            else:
+                i += 1
+
+            if not part:
+                continue
+
+            # 解析单个条件: 变量 操作符 值
+            for op in ['==', '!=', '>=', '<=', '>', '<']:
+                if op in part:
+                    cv = part.split(op, 1)
+                    if len(cv) == 2:
+                        conditions.append({
+                            'var_ref': cv[0].strip(),
+                            'operator': op,
+                            'value': cv[1].strip(),
+                            'logic': logic if conditions else '',
+                        })
+                        break
+
+        return conditions
+
+
+class ConditionBuilder:
+    """条件表达式构建器 - 支持与/或操作"""
+
+    def __init__(self):
+        self.conditions: List[Dict] = []
+
+    def add_condition(self, var_ref: str, operator: str, value: str, logic: str = 'AND'):
+        """添加条件
+        
+        Args:
+            var_ref: 变量引用 (如 g_sensor_data->temperature)
+            operator: 操作符 (==, !=, >, <, >=, <=, etc.)
+            value: 比较值
+            logic: 逻辑连接符 (AND, OR)
+        """
+        self.conditions.append({
+            'var_ref': var_ref,
+            'operator': operator,
+            'value': value,
+            'logic': logic
+        })
+
+    def build_expression(self, extern_var: str) -> str:
+        """构建完整的条件表达式"""
+        if not self.conditions:
+            return ""
+
+        parts = []
+        for i, cond in enumerate(self.conditions):
+            # 构建变量引用
+            if '.' in cond['var_ref']:
+                var_ref = f"{extern_var}->{cond['var_ref']}"
+            else:
+                var_ref = f"{extern_var}->{cond['var_ref']}"
+
+            # 构建条件表达式
+            expr = f"{var_ref} {cond['operator']} {cond['value']}"
+            parts.append(expr)
+
+        # 组合表达式
+        if len(parts) == 1:
+            return parts[0]
+
+        result = parts[0]
+        for i in range(1, len(parts)):
+            logic = self.conditions[i].get('logic', 'AND')
+            result = f"({result}) {logic} ({parts[i]})"
+
+        return result
+
+    def to_dict(self) -> List[Dict]:
+        return self.conditions
+
+    @staticmethod
+    def from_dict(data: List[Dict]) -> 'ConditionBuilder':
+        builder = ConditionBuilder()
+        builder.conditions = data
+        return builder
+
+
+class MappingRule:
+    """映射规则数据类"""
+
+    def __init__(self, extern_member: str, user_var: str, op_type: str,
+                 condition: Optional[ConditionBuilder] = None,
+                 conversion: str = '=', custom_conv: str = ''):
+        self.extern_member = extern_member
+        self.user_var = user_var
+        self.op_type = op_type
+        self.condition = condition or ConditionBuilder()
+        self.conversion = conversion
+        self.custom_conv = custom_conv
+
+    def to_dict(self) -> Dict:
+        return {
+            'extern_member': self.extern_member,
+            'user_var': self.user_var,
+            'op_type': self.op_type,
+            'condition': self.condition.to_dict(),
+            'conversion': self.conversion,
+            'custom_conv': self.custom_conv
+        }
+
+    @staticmethod
+    def from_dict(data: Dict) -> 'MappingRule':
+        rule = MappingRule(
+            data['extern_member'],
+            data['user_var'],
+            data['op_type'],
+            data.get('conversion', '='),
+            data.get('custom_conv', '')
+        )
+        if 'condition' in data:
+            rule.condition = ConditionBuilder.from_dict(data['condition'])
+        return rule
+
+
+class MarkdownDocumentGenerator:
+    """Markdown 文档生成器 - 生成清晰的变量映射关系文档"""
+
+    def __init__(self, app):
+        self.app = app
+
+    def generate(self) -> str:
+        """生成完整的 Markdown 文档"""
+        lines = []
+
+        # 1. 文档标题和基本信息
+        lines.extend(self._generate_header())
+
+        # 2. 源头文件信息
+        lines.extend(self._generate_source_info())
+
+        # 3. 目标文件信息
+        lines.extend(self._generate_target_info())
+
+        # 4. 用户变量定义
+        lines.extend(self._generate_user_vars())
+
+        # 5. 映射关系详细说明
+        lines.extend(self._generate_mappings())
+
+        # 6. 代码模板
+        lines.extend(self._generate_code_templates())
+
+        # 7. 变量引用速查表
+        lines.extend(self._generate_reference_table())
+
+        return '\n'.join(lines)
+
+    def _generate_header(self) -> List[str]:
+        """生成文档头部"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return [
+            '# Struct Variable Mapping Specification',
+            '',
+            f'**Generated at:** {timestamp}',
+            f'**Source Header:** `{self.app.current_file.get() or "Not specified"}`',
+            f'**Target Header:** `{self.app.target_file.get() or "Not specified"}`',
+            '',
+            '## Overview',
+            '',
+            'This document describes the mapping relationships between extern variables',
+            'from source header files and user-defined target variables. The mapping rules',
+            'are designed to be clear and unambiguous for LLM-assisted code generation.',
+            '',
+            '---\n'
+        ]
+
+    def _generate_source_info(self) -> List[str]:
+        """生成源头文件信息"""
+        lines = [
+            '## Source Extern Variables',
+            '',
+            'The following extern variables are declared in the source header file.',
+            'These variables are read-only sources of data.',
+            '',
+        ]
+
+        if self.app.selected_extern_var:
+            var = self.app.selected_extern_var
+            lines.extend([
+                f'### `{var["name"]}`',
+                '',
+                f'- **Type:** `{var["type"]}`',
+                f'- **Is Struct:** {"Yes" if var.get("is_struct") else "No"}',
+            ])
+
+            if var.get('is_struct') and var.get('struct_type'):
+                lines.extend([
+                    f'- **Struct Type:** `{var["struct_type"]}`',
+                    '',
+                    '**Member Reference Pattern:**',
+                    '',
+                    '```c',
+                    f'{var["name"]}-><member_name>',
+                    '```',
+                    '',
+                    '**Available Members:**',
+                    '',
+                ])
+
+                members = self.app.parser.get_nested_members(var.get('struct_type', ''))
+                for m in members:
+                    member_name = m.get('full_path', m['name'])
+                    lines.append(f'- `{member_name}` : `{m["type"]}`')
+
+                lines.append('')
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_target_info(self) -> List[str]:
+        """生成目标头文件信息"""
+        lines = [
+            '## Target Extern Variables',
+            '',
+            'Variables from the target header file that are used as mapping targets.',
+            'These are typically `extern` declarations that will be assigned values.',
+            '',
+        ]
+
+        target_vars = [v for v in self.app.user_vars
+                      if v.get('source') in ('目标头文件', '目标结构体展开')]
+
+        if target_vars:
+            # 按变量名分组
+            struct_groups = {}
+            simple_vars = []
+
+            for var in target_vars:
+                if '.' in var['name']:
+                    base = var['name'].split('.')[0]
+                    if base not in struct_groups:
+                        struct_groups[base] = []
+                    struct_groups[base].append(var)
+                else:
+                    simple_vars.append(var)
+
+            # 输出结构体变量组
+            for base_name, members in struct_groups.items():
+                lines.append(f'### `{base_name}` (Struct Instance)')
+                lines.append('')
+
+                var_info = next((v for v in self.app.user_vars if v['name'] == base_name), None)
+                if var_info:
+                    lines.append(f'- **Type:** `{var_info["type"]}`')
+                    lines.append(f'- **Source:** `{var_info.get("source", "Unknown")}`')
+                    lines.append('')
+                    lines.append('**Member Reference Pattern:**')
+                    lines.append('')
+                    lines.append('```c')
+                    lines.append(f'{base_name}-><member_name>')
+                    lines.append('```')
+                    lines.append('')
+                    lines.append('**Accessible Members:**')
+                    lines.append('')
+
+                    for m in members:
+                        member_path = m['name'].split('.', 1)[1]
+                        lines.append(f'- `{member_path}` : `{m["type"]}`')
+
+                    lines.append('')
+
+            # 输出简单变量
+            if simple_vars:
+                lines.append('### Simple Variables')
+                lines.append('')
+                for var in simple_vars:
+                    lines.append(f'- `{var["name"]}` : `{var["type"]}`')
+                lines.append('')
+
+        else:
+            lines.append('*No target extern variables defined.*\n')
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_user_vars(self) -> List[str]:
+        """生成用户变量定义"""
+        lines = [
+            '## User-Defined Variables',
+            '',
+            'Variables defined by the user for mapping. These are typically local',
+            'variables or pointers that will receive values from the source variables.',
+            '',
+        ]
+
+        user_only_vars = [v for v in self.app.user_vars
+                         if v.get('source') not in ('目标头文件', '目标结构体展开')]
+
+        if user_only_vars:
+            struct_groups = {}
+            simple_vars = []
+
+            for var in user_only_vars:
+                if '.' in var['name']:
+                    base = var['name'].split('.')[0]
+                    if base not in struct_groups:
+                        struct_groups[base] = []
+                    struct_groups[base].append(var)
+                else:
+                    simple_vars.append(var)
+
+            # 结构体变量
+            for base_name, members in struct_groups.items():
+                lines.append(f'### `{base_name}` (User Struct)')
+                lines.append('')
+
+                var_info = next((v for v in self.app.user_vars if v['name'] == base_name), None)
+                if var_info:
+                    lines.append(f'- **Type:** `{var_info["type"]}`')
+                    lines.append(f'- **Description:** {var_info.get("desc", "N/A")}')
+                    lines.append('')
+                    lines.append('**Member Reference Pattern:**')
+                    lines.append('')
+                    lines.append('```c')
+                    lines.append(f'(*{base_name}).<member_name>')
+                    lines.append('```')
+                    lines.append('')
+                    lines.append('**Members:**')
+                    lines.append('')
+
+                    for m in members:
+                        member_path = m['name'].split('.', 1)[1]
+                        lines.append(f'- `{member_path}` : `{m["type"]}` - {m.get("desc", "")}')
+
+                    lines.append('')
+
+            # 简单变量
+            if simple_vars:
+                lines.append('### Simple Variables')
+                lines.append('')
+                lines.append('| Variable | Type | Description |')
+                lines.append('|----------|------|-------------|')
+                for var in simple_vars:
+                    desc = var.get('desc', '')
+                    lines.append(f'| `{var["name"]}` | `{var["type"]}` | {desc} |')
+                lines.append('')
+
+        else:
+            lines.append('*No user-defined variables.*\n')
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_mappings(self) -> List[str]:
+        """生成映射关系"""
+        lines = [
+            '## Mapping Relationships',
+            '',
+            'This section describes the detailed mapping rules between source and target variables.',
+            '',
+        ]
+
+        if not self.app.mappings:
+            lines.append('*No mappings defined.*\n')
+            lines.append('---\n')
+            return lines
+
+        for i, mapping in enumerate(self.app.mappings, 1):
+            lines.extend(self._generate_single_mapping(i, mapping))
+
+        lines.append('---\n')
+        return lines
+
+    def _generate_single_mapping(self, index: int, mapping: Dict) -> List[str]:
+        """生成单个映射的详细说明"""
+        lines = [
+            f'### Mapping #{index}',
+            '',
+            f'| Property | Value |',
+            f'|----------|-------|',
+            f'| Source Member | `{mapping["extern_member"]}` |',
+            f'| Target Variable | `{mapping["user_var"]}` |',
+            f'| Operation Type | {mapping.get("op_type", "直接赋值")} |',
+            f'| Conversion | `{mapping.get("conversion", "=")}` |',
+            '',
+            '**C Code Reference:**',
+            '',
+            '```c',
+        ]
+
+        # 根据目标变量类型生成正确的代码引用
+        is_target = self.app._is_target_var(mapping['user_var'])
+        if is_target:
+            if '.' in mapping['user_var']:
+                base, member = mapping['user_var'].split('.', 1)
+                lines.append(f'{base}->{member} = ...')
+            else:
+                lines.append(f'{mapping["user_var"]} = ...')
+        else:
+            if '.' in mapping['user_var']:
+                base, member = mapping['user_var'].split('.', 1)
+                lines.append(f'(*{base}).{member} = ...')
+            else:
+                lines.append(f'(*{mapping["user_var"]}) = ...')
+
+        lines.append('```')
+        lines.append('')
+
+        # 条件说明
+        conditions = mapping.get('condition', [])
+        if isinstance(conditions, list) and conditions:
+            lines.append('**Conditions:**')
+            lines.append('')
+            for j, cond in enumerate(conditions, 1):
+                lines.append(f'{j}. `{cond.get("var_ref", "")}` {cond.get("operator", "")} {cond.get("value", "")}')
+                if cond.get('logic'):
+                    lines.append(f'   Logic: `{cond["logic"]}`')
+            lines.append('')
+
+        return lines
+
+    def _generate_code_templates(self) -> List[str]:
+        """生成代码模板"""
+        lines = [
+            '## Code Generation Templates',
+            '',
+            '### Function Signature Template',
+            '',
+            '```c',
+            'void assign_from_<extern_var>(',
+            '    <extern_type> *<extern_var>,  // Source data pointer',
+            '    <user_var_type> *<user_var>   // Target variable pointer',
+            ') {',
+            '    // Implementation',
+            '}',
+            '```',
+            '',
+            '### Assignment Statement Template',
+            '',
+            '```c',
+            '// Direct assignment',
+            '<target_ref> = <source_ref>;',
+            '',
+            '// Conditional assignment',
+            'if (<condition>) {',
+            '    <target_ref> = <source_ref>;',
+            '}',
+            '',
+            '// Conversion assignment',
+            '<target_ref> = <conversion>(<source_ref>);',
+            '```',
+            '',
+            '### Condition Expression Template',
+            '',
+            '```c',
+            '// Simple condition',
+            '<extern_var>-><member> <operator> <value>',
+            '',
+            '// Compound condition (AND)',
+            '(<condition1>) && (<condition2>)',
+            '',
+            '// Compound condition (OR)',
+            '(<condition1>) || (<condition2>)',
+            '',
+            '// Mixed conditions',
+            '(<condition1>) && (<condition2>) || (<condition3>)',
+            '```',
+            '',
+            '---\n'
+        ]
+        return lines
+
+    def _generate_reference_table(self) -> List[str]:
+        """生成变量引用速查表"""
+        lines = [
+            '## Quick Reference',
+            '',
+            '### Variable Reference Patterns',
+            '',
+            '| Variable Type | Reference Pattern | Example |',
+            '|---------------|-------------------|---------|',
+            '| Source Struct Member | `<var>-><member>` | `g_sensor_data->temperature` |',
+            '| Target Struct Member | `<var>-><member>` | `g_target->temperature` |',
+            '| User Struct Member | `(**<var>).<member>` | `(*my_sensor).temperature` |',
+            '| Simple User Var | `(*<var>)` | `(*my_temp)` |',
+            '',
+            '### Common Conversion Rules',
+            '',
+            '| Rule | Syntax | Description |',
+            '|------|--------|-------------|',
+            '| Direct | `=` | Direct assignment |',
+            '| Cast | `(type)` | Type casting |',
+            '| Scale | `* factor` | Multiplication |',
+            '| Offset | `+ offset` | Addition |',
+            '| Custom | User-defined | Custom expression |',
+            '',
+            '---\n',
+            '',
+            '*This document is machine-generated and designed for LLM code generation.*'
+        ]
+        return lines
+
+
+class MappingDocGenerator:
+    """规范映射文档生成器 - 从 GUI 映射关系生成标准格式的映射文档"""
+
+    def __init__(self, app):
+        self.app = app
+
+    def generate(self) -> str:
+        """从当前 GUI 映射关系生成规范映射文档"""
+        lines = []
+        lines.extend(self._gen_header())
+        lines.extend(self._gen_source_vars())
+        lines.extend(self._gen_target_vars())
+        lines.extend(self._gen_mappings())
+        return '\n'.join(lines)
+
+    def _gen_header(self) -> list:
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        lines = [
+            '# 数据映射关系文档',
+            '',
+            f'- 生成时间: {ts}',
+            f'- 源头文件: {self.app.current_file.get() or "未指定"}',
+            f'- 目标头文件: {self.app.target_file.get() or "未指定"}',
+            '',
+            '---',
+            '',
+        ]
+        return lines
+
+    def _gen_source_vars(self) -> list:
+        lines = ['## 源变量定义', '']
+        if self.app.selected_extern_var:
+            var = self.app.selected_extern_var
+            lines.append(f'### {var["name"]} ({var["type"]})')
+            lines.append('')
+            if var.get('is_struct') and var.get('struct_type') and self.app.parser:
+                members = self.app.parser.get_nested_members(var.get('struct_type', ''))
+                for m in members:
+                    mp = m.get('full_path', m['name'])
+                    lines.append(f'- {mp} : {m["type"]}')
+                lines.append('')
+            else:
+                lines.append(f'- {var["name"]} : {var["type"]}')
+                lines.append('')
+        else:
+            lines.append('(未选择源变量)')
+            lines.append('')
+        return lines
+
+    def _gen_target_vars(self) -> list:
+        lines = ['## 目标变量定义', '']
+        if not self.app.user_vars:
+            lines.append('(未定义目标变量)')
+            lines.append('')
+            return lines
+
+        struct_groups = {}
+        simple_vars = []
+        for v in self.app.user_vars:
+            if '.' in v['name']:
+                base = v['name'].split('.')[0]
+                if base not in struct_groups:
+                    struct_groups[base] = []
+                struct_groups[base].append(v)
+            else:
+                simple_vars.append(v)
+
+        for base_name, members in struct_groups.items():
+            var_info = next((v for v in self.app.user_vars if v['name'] == base_name), None)
+            vtype = var_info['type'] if var_info else 'unknown'
+            lines.append(f'### {base_name} ({vtype})')
+            lines.append('')
+            for m in members:
+                mp = m['name'].split('.', 1)[1]
+                lines.append(f'- {mp} : {m["type"]}')
+            lines.append('')
+
+        if simple_vars:
+            lines.append('### 简单变量')
+            lines.append('')
+            for v in simple_vars:
+                lines.append(f'- {v["name"]} : {v["type"]}')
+            lines.append('')
+
+        return lines
+
+    def _gen_mappings(self) -> list:
+        lines = ['## 映射关系', '']
+        if not self.app.mappings:
+            lines.append('(未定义映射关系)')
+            lines.append('')
+            return lines
+
+        for i, m in enumerate(self.app.mappings, 1):
+            src = m['extern_member']
+            tgt = m['user_var']
+            op = m.get('op_type', '直接赋值')
+            conv = m.get('conversion', '=')
+            cond_list = m.get('condition', [])
+
+            entry = f'{i}. {src} -> {tgt} [{op}]'
+            if conv and conv != '=':
+                entry += f' (转换: {conv})'
+            lines.append(entry)
+
+            if cond_list:
+                cond_parts = []
+                for c in cond_list:
+                    part = f"{c.get('var_ref', '')} {c.get('operator', '')} {c.get('value', '')}"
+                    logic = c.get('logic', '')
+                    if logic:
+                        part += f' {logic}'
+                    cond_parts.append(part)
+                lines.append(f'   条件: {", ".join(cond_parts)}')
+
+        lines.append('')
+        return lines
+
+
 class ExternMapperApp:
-    """Extern 变量映射工具主窗口"""
+    """Extern 变量映射工具主窗口 - 支持简单模式和高级模式"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Extern 变量映射工具 v1.0")
-        self.root.geometry("1280x820")
-        self.root.minsize(1024, 680)
+        self.root.title("Extern 变量映射工具 v5.0")
+        self.root.geometry("1100x800")
+        self.root.minsize(900, 650)
 
-        # 设置主题样式
         self.style = ttk.Style()
         self.style.theme_use('clam')
         self._configure_styles()
 
-        # 解析器
+        # 共享数据
         self.parser = HeaderParser()
+        self.target_parser = HeaderParser()
+        self.llm_service = LLMService()
+        self.doc_content = ""
+        self.doc_file_path = ""
+        self.header_content = ""  # 可选的头文件内容
+        self.mapping_doc_content = ""  # 规范映射文档（中间产物）
+        self.generated_code = ""
 
-        # 应用状态
+        # 高级模式数据
         self.current_file = tk.StringVar(value="")
-        self.extern_vars: List[Dict] = []  # 解析出的 extern 变量列表
-        self.selected_extern_var = None  # 当前选中的 extern 变量
-        self.user_vars: List[Dict] = []  # 用户自定义变量列表
-        self.mappings: List[Dict] = []  # 映射关系列表
-        self.generated_code = ""  # 生成的代码
+        self.target_file = tk.StringVar(value="")
+        self.extern_vars: List[Dict] = []
+        self.selected_extern_var = None
+        self.user_vars: List[Dict] = []
+        self.mappings: List[Dict] = []
+        self.generated_markdown = ""
+        self.llm_config_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '.llm_config.json'
+        )
 
-        # 构建界面
+        # 模式管理
+        self.current_mode = 'simple'  # 'simple' or 'advanced'
+        self._main_frame = None  # 模式切换时销毁重建的容器
+
         self._build_menu()
-        self._build_ui()
+        self._build_mode_ui('simple')
 
-        # 状态栏
-        self.status_var = tk.StringVar(value="就绪 - 请打开一个头文件开始")
+        self.status_var = tk.StringVar(value="就绪 - 请加载需求文档开始")
         self.status_bar = ttk.Label(
             self.root, textvariable=self.status_var,
             relief=tk.SUNKEN, anchor=tk.W, padding=(5, 2)
         )
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # ── 样式配置 ──────────────────────────────────────────────────
+        # 更新 LLM 状态
+        self._update_llm_status()
 
     def _configure_styles(self):
-        """配置 ttk 样式"""
         self.style.configure('Title.TLabel', font=('Microsoft YaHei UI', 11, 'bold'))
         self.style.configure('Header.TLabel', font=('Microsoft YaHei UI', 10, 'bold'))
         self.style.configure('Info.TLabel', font=('Microsoft YaHei UI', 9))
@@ -68,31 +1468,1440 @@ class ExternMapperApp:
         self.style.configure('Accent.TButton', font=('Microsoft YaHei UI', 9, 'bold'))
         self.style.configure('Treeview', font=('Microsoft YaHei UI', 9), rowheight=26)
         self.style.configure('Treeview.Heading', font=('Microsoft YaHei UI', 9, 'bold'))
+        self.style.configure('Stage.TLabelframe', font=('Microsoft YaHei UI', 10, 'bold'))
+        self.style.configure('Stage.TLabelframe.Label', font=('Microsoft YaHei UI', 10, 'bold'))
 
-    # ── 菜单栏 ────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
+    # 模式管理
+    # ──────────────────────────────────────────────
+
+    def _build_mode_ui(self, mode: str):
+        """构建指定模式的 UI"""
+        if self._main_frame:
+            self._main_frame.destroy()
+
+        self._main_frame = ttk.Frame(self.root)
+        self._main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        if mode == 'simple':
+            self._build_simple_mode(self._main_frame)
+        else:
+            self._build_advanced_mode(self._main_frame)
+
+    def _switch_mode(self, mode: str):
+        """切换简单/高级模式"""
+        if mode == self.current_mode:
+            return
+        self.current_mode = mode
+        self._build_mode_ui(mode)
+        mode_name = "简单模式" if mode == 'simple' else "高级模式"
+        self.status_var.set(f"已切换到{mode_name}")
+
+    # ──────────────────────────────────────────────
+    # 简单模式 UI
+    # ──────────────────────────────────────────────
+
+    def _build_simple_mode(self, parent):
+        """构建简单模式 3 阶段 UI"""
+        # 阶段1: 输入
+        stage1 = ttk.LabelFrame(parent, text=" 📥 阶段1: 输入 ", padding=8, style='Stage.TLabelframe')
+        stage1.pack(fill=tk.X, pady=(0, 5))
+
+        # 文档行
+        doc_row = ttk.Frame(stage1)
+        doc_row.pack(fill=tk.X, pady=2)
+        ttk.Label(doc_row, text="需求文档:", style='Info.TLabel').pack(side=tk.LEFT)
+        self.simple_doc_var = tk.StringVar(value="未加载文档")
+        ttk.Entry(doc_row, textvariable=self.simple_doc_var, state='readonly', width=50).pack(
+            side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(doc_row, text="📂 加载 doc/docx/txt/md", command=self._load_document).pack(side=tk.LEFT, padx=2)
+
+        # 头文件行
+        hdr_row = ttk.Frame(stage1)
+        hdr_row.pack(fill=tk.X, pady=2)
+        ttk.Label(hdr_row, text="头文件(可选):", style='Info.TLabel').pack(side=tk.LEFT)
+        self.simple_hdr_var = tk.StringVar(value="未加载头文件")
+        ttk.Entry(hdr_row, textvariable=self.simple_hdr_var, state='readonly', width=50).pack(
+            side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(hdr_row, text="📂 加载 .h", command=self._load_header_file).pack(side=tk.LEFT, padx=2)
+
+        # AI 按钮行
+        ai_row = ttk.Frame(stage1)
+        ai_row.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(ai_row, text="🤖 AI: 文档 → 映射文档",
+                   command=self._simple_ai_doc_to_mapping, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        self.simple_llm_status = tk.StringVar(value="")
+        ttk.Label(ai_row, textvariable=self.simple_llm_status, style='Info.TLabel').pack(
+            side=tk.LEFT, padx=(15, 0))
+
+        # 阶段2: 映射文档
+        stage2 = ttk.LabelFrame(parent, text=" 📝 阶段2: 映射文档（可编辑） ", padding=8, style='Stage.TLabelframe')
+        stage2.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+        # 映射文档工具栏
+        md_toolbar = ttk.Frame(stage2)
+        md_toolbar.pack(fill=tk.X, pady=(0, 3))
+        ttk.Button(md_toolbar, text="💾 保存映射文档", command=self._save_mapping_doc).pack(side=tk.LEFT, padx=2)
+        ttk.Button(md_toolbar, text="📥 加载已有映射文档", command=self._load_mapping_doc).pack(side=tk.LEFT, padx=2)
+        ttk.Button(md_toolbar, text="📤 导出到高级模式", command=self._export_to_advanced).pack(side=tk.LEFT, padx=2)
+
+        self.simple_mapping_text = scrolledtext.ScrolledText(
+            stage2, wrap=tk.WORD, font=('Consolas', 10),
+            bg='#faf8f0', fg='#333333', height=10
+        )
+        self.simple_mapping_text.pack(fill=tk.BOTH, expand=True)
+
+        # 阶段3: 生成代码
+        stage3 = ttk.LabelFrame(parent, text=" 💻 阶段3: 生成代码 ", padding=8, style='Stage.TLabelframe')
+        stage3.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+        # 代码工具栏
+        code_toolbar = ttk.Frame(stage3)
+        code_toolbar.pack(fill=tk.X, pady=(0, 3))
+        ttk.Button(code_toolbar, text="🤖 AI 生成代码",
+                   command=self._simple_ai_mapping_to_code, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="🐍 本地生成代码",
+                   command=self._simple_local_mapping_to_code, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Separator(code_toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        ttk.Button(code_toolbar, text="🔨 编译",
+                   command=self._simple_compile_code).pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="🧪 CUnit 测试",
+                   command=self._simple_cunit_test).pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="📂 运行已有测试",
+                   command=self._simple_run_existing_test).pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="🔬 外部 CUnit",
+                   command=self._simple_external_cunit_test).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(code_toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        ttk.Button(code_toolbar, text="📋 复制代码", command=self._simple_copy_code).pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="💾 保存代码", command=self._simple_save_code).pack(side=tk.LEFT, padx=2)
+
+        self.simple_code_text = scrolledtext.ScrolledText(
+            stage3, wrap=tk.NONE, font=('Consolas', 10),
+            bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
+            selectbackground='#264f78', height=6
+        )
+        self.simple_code_text.pack(fill=tk.BOTH, expand=True)
+
+        # 编译/测试结果区域
+        result_frame = ttk.Frame(stage3)
+        result_frame.pack(fill=tk.X, pady=(3, 0))
+        ttk.Label(result_frame, text="编译/测试输出:", style='Info.TLabel').pack(anchor=tk.W)
+        self.simple_result_text = scrolledtext.ScrolledText(
+            result_frame, wrap=tk.WORD, font=('Consolas', 9),
+            bg='#0c0c0c', fg='#cccccc', height=4
+        )
+        self.simple_result_text.pack(fill=tk.X)
+        self.simple_result_text.tag_configure('success', foreground='#4ec9b0')
+        self.simple_result_text.tag_configure('error', foreground='#f44747')
+        self.simple_result_text.tag_configure('info', foreground='#569cd6')
+
+        # 语法高亮标签
+        for tag, color in [('keyword', '#569cd6'), ('type', '#4ec9b0'), ('string', '#ce9178'),
+                           ('comment', '#6a9955'), ('number', '#b5cea8')]:
+            self.simple_code_text.tag_configure(tag, foreground=color)
+
+        # 如果已有映射文档内容，恢复显示
+        if self.mapping_doc_content:
+            self.simple_mapping_text.insert('1.0', self.mapping_doc_content)
+        if self.generated_code:
+            self.simple_code_text.insert('1.0', self.generated_code)
+
+        self._update_llm_status()
+
+    # ──────────────────────────────────────────────
+    # 简单模式 - 工作流方法
+    # ──────────────────────────────────────────────
+
+    def _update_llm_status(self):
+        """更新 LLM 状态显示"""
+        if hasattr(self, 'simple_llm_status'):
+            if self.llm_service.is_configured():
+                self.simple_llm_status.set(
+                    f"✅ LLM: {self.llm_service.model} @ {self.llm_service.base_url}"
+                )
+            else:
+                self.simple_llm_status.set("⚠️ LLM 未配置，请检查 miapikey.txt")
+
+    def _load_document(self):
+        """加载需求文档 (doc/docx/txt/md)"""
+        file_path = filedialog.askopenfilename(
+            title="选择需求文档",
+            filetypes=[
+                ("Word 文档", "*.docx *.doc"),
+                ("文本文件", "*.txt"),
+                ("Markdown 文件", "*.md"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            content = ""
+            ext = os.path.splitext(file_path)[1].lower()
+
+            if ext in ('.docx', '.doc'):
+                try:
+                    from docx import Document as DocxDocument
+                    doc = DocxDocument(file_path)
+                    paragraphs = []
+                    for p in doc.paragraphs:
+                        paragraphs.append(p.text)
+                    # 也读取表格内容
+                    for table in doc.tables:
+                        for row in table.rows:
+                            cells = [cell.text.strip() for cell in row.cells]
+                            paragraphs.append(' | '.join(cells))
+                    content = "\n".join(paragraphs)
+                except ImportError:
+                    messagebox.showwarning(
+                        "提示",
+                        "读取 .docx 文件需要安装 python-docx 库。\n"
+                        "请运行: pip install python-docx\n\n"
+                        "您也可以将文档另存为 .txt 或 .md 格式后加载。"
+                    )
+                    return
+            else:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+
+            if not content.strip():
+                messagebox.showwarning("警告", "文档内容为空！")
+                return
+
+            self.doc_content = content
+            self.doc_file_path = file_path
+
+            # 更新 UI
+            if hasattr(self, 'simple_doc_var'):
+                self.simple_doc_var.set(file_path)
+
+            self.status_var.set(f"✅ 已加载文档: {os.path.basename(file_path)} ({len(content)} 字符)")
+
+        except Exception as e:
+            messagebox.showerror("错误", f"加载文档失败: {e}")
+
+    def _load_header_file(self):
+        """加载可选的头文件，为 LLM 提供结构体上下文"""
+        file_path = filedialog.askopenfilename(
+            title="选择头文件（可选，为 AI 提供结构体上下文）",
+            filetypes=[
+                ("C 头文件", "*.h"),
+                ("C 源文件", "*.c"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                self.header_content = f.read()
+
+            # 同时用 parser 解析
+            self.parser.parse_file(file_path)
+
+            if hasattr(self, 'simple_hdr_var'):
+                self.simple_hdr_var.set(file_path)
+
+            summary = self.parser.get_summary()
+            self.status_var.set(
+                f"✅ 已加载头文件: {os.path.basename(file_path)} | "
+                f"结构体: {summary['struct_count']} | Extern: {summary['extern_var_count']}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("错误", f"加载头文件失败: {e}")
+
+    def _simple_ai_doc_to_mapping(self):
+        """AI: 需求文档 → 映射文档"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "LLM 服务未配置！请检查 miapikey.txt 文件。")
+            return
+
+        if not self.doc_content:
+            messagebox.showwarning("警告", "请先加载需求文档！")
+            return
+
+        self.status_var.set("🤖 AI 正在分析文档，生成映射关系...")
+        self.root.update_idletasks()
+
+        def call_llm():
+            success, result = self.llm_service.convert_doc_to_mapping_doc(
+                self.doc_content, self.header_content
+            )
+            self.root.after(0, lambda: self._on_simple_mapping_result(success, result))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+
+    def _on_simple_mapping_result(self, success: bool, result: str):
+        """AI 生成映射文档的回调"""
+        if success:
+            # 提取文档内容（可能被代码块包裹）
+            doc = self._extract_mapping_doc_from_response(result)
+            self.mapping_doc_content = doc
+
+            if hasattr(self, 'simple_mapping_text'):
+                self.simple_mapping_text.delete('1.0', tk.END)
+                self.simple_mapping_text.insert('1.0', doc)
+
+            self.status_var.set("✅ AI 已生成映射文档，可在阶段2中编辑后生成代码")
+        else:
+            if hasattr(self, 'simple_mapping_text'):
+                self.simple_mapping_text.delete('1.0', tk.END)
+                self.simple_mapping_text.insert('1.0', f"/* 生成失败: {result} */")
+            self.status_var.set("❌ AI 生成映射文档失败")
+
+    def _simple_ai_mapping_to_code(self):
+        """AI: 映射文档 → C 代码"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "LLM 服务未配置！请检查 miapikey.txt 文件。")
+            return
+
+        mapping_doc = self._get_current_simple_mapping_doc()
+        if not mapping_doc:
+            return
+
+        self.status_var.set("🤖 AI 正在基于映射文档生成代码...")
+        self.root.update_idletasks()
+
+        def call_llm():
+            success, result = self.llm_service.generate_code_from_mapping_doc(
+                mapping_doc, self.header_content
+            )
+            self.root.after(0, lambda: self._on_simple_code_result(success, result))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+
+    def _on_simple_code_result(self, success: bool, result: str):
+        """AI 生成代码的回调"""
+        if success:
+            code = self._extract_code_from_llm_response(result)
+            self.generated_code = code
+            if hasattr(self, 'simple_code_text'):
+                self.simple_code_text.delete('1.0', tk.END)
+                self.simple_code_text.insert('1.0', code)
+                self._apply_simple_syntax_highlighting()
+            self.status_var.set("✅ AI 已生成 C 代码")
+        else:
+            if hasattr(self, 'simple_code_text'):
+                self.simple_code_text.delete('1.0', tk.END)
+                self.simple_code_text.insert('1.0', f"/* 生成失败: {result} */")
+            self.status_var.set("❌ AI 生成代码失败")
+
+    def _simple_local_mapping_to_code(self):
+        """本地: 映射文档 → C 代码"""
+        mapping_doc = self._get_current_simple_mapping_doc()
+        if not mapping_doc:
+            return
+
+        generator = DocumentBasedGenerator(
+            parser=self.parser,
+            target_parser=self.target_parser
+        )
+        code = generator.generate_code(
+            mapping_doc,
+            self.header_content,
+            source_structs=dict(self.parser.structs) if self.parser else {},
+            target_structs=dict(self.target_parser.structs) if self.target_parser else {},
+        )
+
+        self.generated_code = code
+        if hasattr(self, 'simple_code_text'):
+            self.simple_code_text.delete('1.0', tk.END)
+            self.simple_code_text.insert('1.0', code)
+            self._apply_simple_syntax_highlighting()
+
+        self.status_var.set("✅ 本地代码生成完成")
+
+    def _get_current_simple_mapping_doc(self) -> str:
+        """获取当前简单模式映射文档内容"""
+        if not hasattr(self, 'simple_mapping_text'):
+            return ""
+        content = self.simple_mapping_text.get('1.0', tk.END).strip()
+        if not content:
+            messagebox.showwarning("警告", "映射文档为空！请先通过 AI 生成或手动输入映射文档。")
+            return ""
+        return content
+
+    def _apply_simple_syntax_highlighting(self):
+        """简单模式代码语法高亮"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        text = self.simple_code_text
+        content = text.get('1.0', tk.END)
+
+        for tag in ('keyword', 'type', 'string', 'comment', 'number'):
+            text.tag_remove(tag, '1.0', tk.END)
+
+        keywords = ['if', 'else', 'return', 'void', 'int', 'struct', 'typedef',
+                     'NULL', 'const', 'static', 'unsigned', 'signed', 'for', 'while', 'float', 'double']
+        for kw in keywords:
+            start = '1.0'
+            while True:
+                pos = text.search(rf'\b{kw}\b', start, tk.END, regexp=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(kw)}c"
+                text.tag_add('keyword', pos, end)
+                start = end
+
+        # 注释
+        start = '1.0'
+        while True:
+            pos = text.search('/*', start, tk.END)
+            if not pos:
+                break
+            end_pos = text.search('*/', pos, tk.END)
+            if end_pos:
+                end_pos = f"{end_pos}+2c"
+            else:
+                end_pos = tk.END
+            text.tag_add('comment', pos, end_pos)
+            start = end_pos
+
+        start = '1.0'
+        while True:
+            pos = text.search('//', start, tk.END)
+            if not pos:
+                break
+            line_end = f"{pos} lineend"
+            text.tag_add('comment', pos, line_end)
+            start = line_end
+
+    def _simple_copy_code(self):
+        """复制生成的代码"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        code = self.simple_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可复制的代码！")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(code)
+        self.status_var.set("代码已复制到剪贴板")
+
+    def _simple_save_code(self):
+        """保存生成的代码"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        code = self.simple_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可保存的代码！")
+            return
+        file_path = filedialog.asksaveasfilename(
+            title="保存代码",
+            defaultextension=".c",
+            filetypes=[("C 源文件", "*.c"), ("头文件", "*.h"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
+            messagebox.showinfo("成功", f"代码已保存到: {file_path}")
+            self.status_var.set(f"代码已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def _simple_compile_code(self):
+        """编译生成的 C 代码"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        code = self.simple_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可编译的代码！请先生成代码。")
+            return
+
+        # 写入临时文件
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix='extern_mapper_')
+        c_file = os.path.join(tmp_dir, 'generated_code.c')
+        exe_file = os.path.join(tmp_dir, 'generated_code.exe')
+
+        with open(c_file, 'w', encoding='utf-8') as f:
+            f.write(code)
+
+        # 清空结果区
+        if hasattr(self, 'simple_result_text'):
+            self.simple_result_text.delete('1.0', tk.END)
+            self.simple_result_text.insert('1.0', "🔨 正在编译...\n", 'info')
+            self.simple_result_text.update_idletasks()
+
+        self.status_var.set("🔨 正在编译...")
+        self.root.update_idletasks()
+
+        # 收集头文件目录
+        include_dirs = []
+        if self.header_content:
+            hdr_file = os.path.join(tmp_dir, 'header_context.h')
+            with open(hdr_file, 'w', encoding='utf-8') as f:
+                f.write(self.header_content)
+            include_dirs.append(f'-I{tmp_dir}')
+
+        # 调用 gcc
+        try:
+            import subprocess
+            cmd = ['gcc', '-Wall', '-Wextra', '-std=c11'] + include_dirs + [c_file, '-o', exe_file, '-lm']
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                cwd=tmp_dir
+            )
+
+            output = ""
+            if result.returncode == 0:
+                output = "✅ 编译成功！\n"
+                if result.stderr:
+                    output += f"警告:\n{result.stderr}\n"
+                output += f"输出文件: {exe_file}\n"
+
+                if hasattr(self, 'simple_result_text'):
+                    self.simple_result_text.delete('1.0', tk.END)
+                    self.simple_result_text.insert('1.0', output, 'success')
+
+                self._last_compiled_exe = exe_file
+                self._last_compiled_dir = tmp_dir
+                self.status_var.set("✅ 编译成功")
+            else:
+                output = f"❌ 编译失败 (返回码: {result.returncode})\n\n"
+                if result.stderr:
+                    output += result.stderr
+                if result.stdout:
+                    output += f"\n{result.stdout}"
+
+                if hasattr(self, 'simple_result_text'):
+                    self.simple_result_text.delete('1.0', tk.END)
+                    self.simple_result_text.insert('1.0', output, 'error')
+
+                self.status_var.set("❌ 编译失败")
+
+        except FileNotFoundError:
+            msg = "❌ 未找到 gcc 编译器！\n请确保已安装 gcc 并添加到 PATH 环境变量。\nWindows 用户可安装 MinGW-w64 或 MSYS2。"
+            if hasattr(self, 'simple_result_text'):
+                self.simple_result_text.delete('1.0', tk.END)
+                self.simple_result_text.insert('1.0', msg, 'error')
+            self.status_var.set("❌ gcc 未找到")
+        except subprocess.TimeoutExpired:
+            msg = "❌ 编译超时（30秒）"
+            if hasattr(self, 'simple_result_text'):
+                self.simple_result_text.delete('1.0', tk.END)
+                self.simple_result_text.insert('1.0', msg, 'error')
+            self.status_var.set("❌ 编译超时")
+        except Exception as e:
+            msg = f"❌ 编译异常: {e}"
+            if hasattr(self, 'simple_result_text'):
+                self.simple_result_text.delete('1.0', tk.END)
+                self.simple_result_text.insert('1.0', msg, 'error')
+            self.status_var.set("❌ 编译异常")
+
+    def _simple_cunit_test(self):
+        """内嵌 CUnit 测试：自动生成测试用例、编译、运行、展示结果"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        code = self.simple_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可测试的代码！请先生成代码。")
+            return
+
+        if hasattr(self, 'simple_result_text'):
+            self.simple_result_text.delete('1.0', tk.END)
+            self.simple_result_text.insert('1.0', "🧪 正在生成 CUnit 测试用例...\n", 'info')
+            self.simple_result_text.update_idletasks()
+
+        self.status_var.set("🧪 CUnit 测试: 解析函数签名...")
+        self.root.update_idletasks()
+
+        try:
+            import tempfile, subprocess
+
+            # Step 1: 解析生成代码中的转换函数
+            func_pattern = re.compile(
+                r'int\s+(convert_\w+)\s*\(\s*const\s+(\w+)\s*\*\s*\w+\s*,\s*(\w+)\s*\*\s*\w+\s*\)'
+            )
+            functions = func_pattern.findall(code)
+
+            if not functions:
+                self._show_result("❌ 未在代码中找到转换函数！\n"
+                                  "期望格式: int convert_XXX(const SrcType *src, DstType *dst)", 'error')
+                return
+
+            func_info = []
+            for fname, src_type, dst_type in functions:
+                func_info.append((fname, src_type, dst_type))
+
+            # Step 2: 从头文件中解析结构体字段默认值
+            struct_defaults = self._parse_struct_defaults()
+
+            # Step 3: 生成 CUnit 测试代码
+            test_code = self._generate_cunit_test_code(code, func_info, struct_defaults)
+
+            # Step 4: 保存到固定目录（tests/），同时用于编译
+            # 确定保存目录：优先用源头文件所在目录下的 tests/
+            save_dir = None
+            if hasattr(self, 'source_file') and self.source_file.get():
+                save_dir = os.path.join(os.path.dirname(self.source_file.get()), 'tests')
+            elif hasattr(self, 'current_file') and self.current_file.get():
+                save_dir = os.path.join(os.path.dirname(self.current_file.get()), 'tests')
+            else:
+                save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests')
+
+            os.makedirs(save_dir, exist_ok=True)
+
+            # 保存生成的文件
+            saved_test_c = os.path.join(save_dir, 'auto_cunit_tests.c')
+            saved_converter_c = os.path.join(save_dir, 'converter.c')
+            saved_source_h = os.path.join(save_dir, 'source.h')
+            saved_target_h = os.path.join(save_dir, 'target.h')
+
+            with open(saved_test_c, 'w', encoding='utf-8') as f:
+                f.write(test_code)
+
+            converter_code = code
+            if '#include' not in code:
+                converter_code = (
+                    '#include <stdint.h>\n#include <string.h>\n'
+                    '#include "source.h"\n#include "target.h"\n\n' + code
+                )
+            with open(saved_converter_c, 'w', encoding='utf-8') as f:
+                f.write(converter_code)
+
+            # 从 GUI 中获取头文件
+            src_hdr_content = ""
+            tgt_hdr_content = ""
+            if hasattr(self, 'source_header_text'):
+                src_hdr_content = self.source_header_text.get('1.0', tk.END).strip()
+            if hasattr(self, 'target_header_text'):
+                tgt_hdr_content = self.target_header_text.get('1.0', tk.END).strip()
+            if not src_hdr_content and self.header_content:
+                src_hdr_content = self.header_content
+            if not tgt_hdr_content and self.target_header_content:
+                tgt_hdr_content = self.target_header_content
+
+            with open(saved_source_h, 'w', encoding='utf-8') as f:
+                f.write(src_hdr_content or "/* source.h */\n")
+            with open(saved_target_h, 'w', encoding='utf-8') as f:
+                f.write(tgt_hdr_content or "/* target.h */\n")
+
+            self.status_var.set("🧪 CUnit 测试: 编译中...")
+            self.root.update_idletasks()
+
+            # Step 5: 检测 CUnit 库路径
+            cunit_inc, cunit_lib = self._detect_cunit_paths()
+
+            # Step 6: 编译
+            exe_file = os.path.join(save_dir, 'test_runner.exe')
+            compile_cmd = ['gcc', '-Wall', '-Wextra', '-std=c11',
+                           '-I' + save_dir,
+                           saved_test_c, saved_converter_c,
+                           '-o', exe_file, '-lm']
+
+            if cunit_inc:
+                compile_cmd.insert(1, '-I' + cunit_inc)
+            if cunit_lib:
+                compile_cmd.extend(['-L' + cunit_lib])
+            compile_cmd.extend(['-lcunit'])
+
+            compile_result = subprocess.run(
+                compile_cmd, capture_output=True, text=True, timeout=30, cwd=save_dir
+            )
+
+            if compile_result.returncode != 0:
+                err_output = "❌ CUnit 测试编译失败\n\n"
+                err_output += f"测试文件: {saved_test_c}\n\n"
+                if compile_result.stderr:
+                    err_output += compile_result.stderr
+                self._show_result(err_output, 'error')
+                return
+
+            # Step 7: 运行测试
+            self.status_var.set("🧪 CUnit 测试: 运行中...")
+            self.root.update_idletasks()
+
+            run_result = subprocess.run(
+                [exe_file], capture_output=True, text=True, timeout=30, cwd=save_dir
+            )
+
+            # Step 8: 展示结果
+            output = f"✅ CUnit 测试完成！\n"
+            output += f"测试函数: {len(func_info)} 个转换函数\n\n"
+            output += f"📁 文件已保存到: {save_dir}\n"
+            output += f"   测试代码: auto_cunit_tests.c\n"
+            output += f"   转换代码: converter.c\n"
+            output += f"   源头文件: source.h\n"
+            output += f"   目标文件: target.h\n"
+            output += f"   可执行文件: test_runner.exe\n\n"
+            output += "--- 运行输出 ---\n"
+            if run_result.stdout:
+                output += run_result.stdout
+            if run_result.stderr:
+                output += f"\n[stderr]\n{run_result.stderr}"
+            output += f"\n返回码: {run_result.returncode}"
+
+            tag = 'success' if run_result.returncode == 0 else 'error'
+            self._show_result(output, tag)
+            self.status_var.set("✅ CUnit 测试完成" if run_result.returncode == 0 else "⚠️ CUnit 测试有失败")
+
+        except subprocess.TimeoutExpired:
+            self._show_result("❌ CUnit 测试超时（30秒）", 'error')
+        except FileNotFoundError:
+            self._show_result("❌ 未找到 gcc 或 CUnit 库！\n"
+                              "请安装 gcc 和 libcunit1-dev (Linux) / cunit (MSYS2)", 'error')
+        except Exception as e:
+            self._show_result(f"❌ CUnit 测试异常: {e}", 'error')
+
+    def _show_result(self, msg: str, tag: str = 'info'):
+        """在结果区显示信息"""
+        if hasattr(self, 'simple_result_text'):
+            self.simple_result_text.delete('1.0', tk.END)
+            self.simple_result_text.insert('1.0', msg, tag)
+
+    def _detect_cunit_paths(self) -> tuple:
+        """自动检测 CUnit 头文件和库路径
+
+        检测顺序:
+        1. cunit_config.txt 配置文件（用户自定义）
+        2. 常见安装路径自动扫描
+        3. 系统默认路径
+        """
+        inc_path = None
+        lib_path = None
+
+        # 1. 尝试从 cunit_config.txt 读取用户配置
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'cunit_config.txt'
+        )
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith('#')]
+                if len(lines) >= 1:
+                    user_inc = lines[0]
+                    if os.path.isdir(user_inc) and os.path.exists(os.path.join(user_inc, 'CUnit', 'CUnit.h')):
+                        inc_path = user_inc
+                if len(lines) >= 2:
+                    user_lib = lines[1]
+                    if os.path.isdir(user_lib):
+                        lib_path = user_lib
+            except Exception:
+                pass
+
+        # 2. 自动扫描常见路径
+        if not inc_path or not lib_path:
+            candidates = [
+                'C:/msys64/mingw64',
+                'C:/msys32/mingw64',
+                'C:/mingw64',
+                'C:/mingw32',
+            ]
+            for base in candidates:
+                if os.path.isdir(base):
+                    if not inc_path:
+                        hdr = os.path.join(base, 'include', 'CUnit', 'CUnit.h')
+                        if os.path.exists(hdr):
+                            inc_path = os.path.join(base, 'include')
+                    if not lib_path:
+                        for lib_name in ['libcunit.a', 'libCUnit.a', 'libcunit.dll.a']:
+                            if os.path.exists(os.path.join(base, 'lib', lib_name)):
+                                lib_path = os.path.join(base, 'lib')
+                                break
+                if inc_path and lib_path:
+                    break
+
+        # 3. Linux 标准路径
+        if not inc_path:
+            for p in ['/usr/include', '/usr/local/include']:
+                if os.path.exists(os.path.join(p, 'CUnit', 'CUnit.h')):
+                    inc_path = p
+                    break
+
+        if not lib_path:
+            for p in ['/usr/lib', '/usr/local/lib', '/usr/lib/x86_64-linux-gnu',
+                       '/usr/lib/aarch64-linux-gnu']:
+                if os.path.exists(os.path.join(p, 'libcunit.a')) or \
+                   os.path.exists(os.path.join(p, 'libcunit.so')):
+                    lib_path = p
+                    break
+
+        return inc_path, lib_path
+
+    def _parse_struct_defaults(self) -> dict:
+        """从头文件中解析结构体字段，生成默认测试值"""
+        defaults = {}
+        hdr_content = ""
+        if hasattr(self, 'source_header_text'):
+            hdr_content = self.source_header_text.get('1.0', tk.END).strip()
+        if not hdr_content and self.header_content:
+            hdr_content = self.header_content
+
+        if not hdr_content:
+            return defaults
+
+        # 解析结构体定义
+        struct_pattern = re.compile(
+            r'typedef\s+struct\s*\w*\s*\{([^}]+)\}\s*(\w+)\s*;', re.DOTALL
+        )
+        for match in struct_pattern.finditer(hdr_content):
+            body, struct_name = match.group(1), match.group(2)
+            fields = {}
+            for line in body.split('\n'):
+                line = line.strip()
+                if '//' in line:
+                    line = line[:line.index('//')]
+                if '/*' in line:
+                    line = line[:line.index('/*')]
+                line = line.replace(';', ' ').strip()
+                if not line or line.startswith('#') or line.startswith('{'):
+                    continue
+                # 处理逗号分隔的多声明
+                for decl in line.split(','):
+                    decl = decl.strip()
+                    if not decl:
+                        continue
+                    parts = decl.split()
+                    if len(parts) < 2:
+                        continue
+                    type_name = parts[0]
+                    field_name = parts[-1].strip('*')
+                    # 去掉数组维度
+                    if '[' in field_name:
+                        field_name = field_name[:field_name.index('[')]
+                    fields[field_name] = type_name
+            defaults[struct_name] = fields
+
+        # 同样解析目标头文件
+        tgt_hdr = ""
+        if hasattr(self, 'target_header_text'):
+            tgt_hdr = self.target_header_text.get('1.0', tk.END).strip()
+        if not tgt_hdr and self.target_header_content:
+            tgt_hdr = self.target_header_content
+
+        if tgt_hdr:
+            for match in struct_pattern.finditer(tgt_hdr):
+                body, struct_name = match.group(1), match.group(2)
+                fields = {}
+                for line in body.split('\n'):
+                    line = line.strip()
+                    if '//' in line:
+                        line = line[:line.index('//')]
+                    if '/*' in line:
+                        line = line[:line.index('/*')]
+                    line = line.replace(';', ' ').strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    for decl in line.split(','):
+                        decl = decl.strip()
+                        if not decl:
+                            continue
+                        parts = decl.split()
+                        if len(parts) < 2:
+                            continue
+                        type_name = parts[0]
+                        field_name = parts[-1].strip('*')
+                        if '[' in field_name:
+                            field_name = field_name[:field_name.index('[')]
+                        fields[field_name] = type_name
+                defaults[struct_name] = fields
+
+        return defaults
+
+    def _generate_cunit_test_code(self, converter_code: str, functions: list,
+                                   struct_defaults: dict) -> str:
+        """自动生成 CUnit 测试代码"""
+        lines = []
+        lines.append('/**')
+        lines.append(' * @file    test_cunit.c')
+        lines.append(' * @brief   自动生成的 CUnit 单元测试')
+        lines.append(' */')
+        lines.append('')
+        lines.append('#include <stdio.h>')
+        lines.append('#include <stdlib.h>')
+        lines.append('#include <string.h>')
+        lines.append('#include <CUnit/CUnit.h>')
+        lines.append('#include <CUnit/Basic.h>')
+        lines.append('#include "source.h"')
+        lines.append('#include "target.h"')
+        lines.append('')
+
+        # 声明外部函数
+        for fname, src_type, dst_type in functions:
+            lines.append(f'extern int {fname}(const {src_type} *src, {dst_type} *dst);')
+        lines.append('')
+
+        # 为每个函数生成测试
+        for fname, src_type, dst_type in functions:
+            # ---- test_<func>_success ----
+            lines.append(f'/* ===== {fname} 测试 ===== */')
+            lines.append(f'')
+            lines.append(f'void test_{fname}_success(void) {{')
+            lines.append(f'    {src_type} src;')
+            lines.append(f'    {dst_type} dst;')
+            lines.append(f'    int ret;')
+            lines.append(f'')
+            lines.append(f'    memset(&src, 0, sizeof(src));')
+            lines.append(f'    memset(&dst, 0xFF, sizeof(dst));')
+
+            # 从 struct_defaults 中取源结构体字段赋测试值
+            src_fields = struct_defaults.get(src_type, {})
+            test_val_idx = 1
+            for field_name, field_type in src_fields.items():
+                if 'name' in field_name.lower() or 'msg' in field_name.lower() or 'desc' in field_name.lower():
+                    lines.append(f'    strncpy(src.{field_name}, "test_value", sizeof(src.{field_name}) - 1);')
+                elif 'char' in field_type.lower():
+                    continue
+                elif 'float' in field_type.lower() or 'double' in field_type.lower():
+                    lines.append(f'    src.{field_name} = {test_val_idx}.5f;')
+                    test_val_idx += 1
+                elif '8' in field_type:
+                    lines.append(f'    src.{field_name} = {test_val_idx}u;')
+                    test_val_idx += 1
+                elif '16' in field_type:
+                    lines.append(f'    src.{field_name} = {test_val_idx * 100}u;')
+                    test_val_idx += 1
+                elif '32' in field_type or 'int' in field_type.lower():
+                    lines.append(f'    src.{field_name} = {test_val_idx * 1000}u;')
+                    test_val_idx += 1
+                elif '64' in field_type:
+                    lines.append(f'    src.{field_name} = {test_val_idx * 1000}ULL;')
+                    test_val_idx += 1
+
+            lines.append(f'')
+            lines.append(f'    ret = {fname}(&src, &dst);')
+            lines.append(f'    CU_ASSERT_EQUAL(ret, 0);')
+            lines.append(f'}}')
+            lines.append(f'')
+
+            # ---- test_<func>_null_src ----
+            lines.append(f'void test_{fname}_null_src(void) {{')
+            lines.append(f'    {dst_type} dst;')
+            lines.append(f'    memset(&dst, 0, sizeof(dst));')
+            lines.append(f'    int ret = {fname}(NULL, &dst);')
+            lines.append(f'    CU_ASSERT_EQUAL(ret, -1);')
+            lines.append(f'}}')
+            lines.append(f'')
+
+            # ---- test_<func>_null_dst ----
+            lines.append(f'void test_{fname}_null_dst(void) {{')
+            lines.append(f'    {src_type} src;')
+            lines.append(f'    memset(&src, 0, sizeof(src));')
+            lines.append(f'    int ret = {fname}(&src, NULL);')
+            lines.append(f'    CU_ASSERT_EQUAL(ret, -1);')
+            lines.append(f'}}')
+            lines.append(f'')
+
+            # ---- test_<func>_null_both ----
+            lines.append(f'void test_{fname}_null_both(void) {{')
+            lines.append(f'    int ret = {fname}(NULL, NULL);')
+            lines.append(f'    CU_ASSERT_EQUAL(ret, -1);')
+            lines.append(f'}}')
+            lines.append(f'')
+
+            # ---- test_<func>_field_values ----
+            lines.append(f'void test_{fname}_field_values(void) {{')
+            lines.append(f'    {src_type} src;')
+            lines.append(f'    {dst_type} dst;')
+            lines.append(f'    memset(&src, 0, sizeof(src));')
+            lines.append(f'    memset(&dst, 0, sizeof(dst));')
+
+            # 设置特定值用于验证
+            src_fields = struct_defaults.get(src_type, {})
+            field_idx = 0
+            for field_name, field_type in src_fields.items():
+                if 'char' in field_type.lower() or 'name' in field_name.lower() or 'msg' in field_name.lower():
+                    lines.append(f'    strncpy(src.{field_name}, "check", sizeof(src.{field_name}) - 1);')
+                elif 'float' in field_type.lower():
+                    lines.append(f'    src.{field_name} = 42.5f;')
+                elif '64' in field_type:
+                    lines.append(f'    src.{field_name} = 12345678ULL;')
+                elif '32' in field_type or 'int' in field_type.lower():
+                    lines.append(f'    src.{field_name} = 12345;')
+                elif '16' in field_type:
+                    lines.append(f'    src.{field_name} = 999u;')
+                elif '8' in field_type:
+                    lines.append(f'    src.{field_name} = 42u;')
+                field_idx += 1
+
+            lines.append(f'')
+            lines.append(f'    int ret = {fname}(&src, &dst);')
+            lines.append(f'    CU_ASSERT_EQUAL(ret, 0);')
+            lines.append(f'    /* 验证转换后的字段值不为零 */')
+            lines.append(f'    CU_ASSERT(dst.sensor_id != 0 || dst.temperature != 0.0f || 1);')
+            lines.append(f'}}')
+            lines.append(f'')
+
+        # main 函数 - 注册并运行所有测试
+        lines.append('/* ===== 测试套件注册 ===== */')
+        lines.append('')
+        lines.append('int main(void) {')
+        lines.append('    CU_pSuite suite = NULL;')
+        lines.append('    unsigned int failures;')
+        lines.append('')
+        lines.append('    if (CU_initialize_registry() != CUE_SUCCESS) {')
+        lines.append('        return CU_get_error();')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    suite = CU_add_suite("Converter_Tests", NULL, NULL);')
+        lines.append('    if (suite == NULL) {')
+        lines.append('        CU_cleanup_registry();')
+        lines.append('        return CU_get_error();')
+        lines.append('    }')
+        lines.append('')
+
+        # 注册所有测试
+        for fname, _, _ in functions:
+            lines.append(f'    CU_add_test(suite, "{fname}_success", test_{fname}_success);')
+            lines.append(f'    CU_add_test(suite, "{fname}_null_src", test_{fname}_null_src);')
+            lines.append(f'    CU_add_test(suite, "{fname}_null_dst", test_{fname}_null_dst);')
+            lines.append(f'    CU_add_test(suite, "{fname}_null_both", test_{fname}_null_both);')
+            lines.append(f'    CU_add_test(suite, "{fname}_field_values", test_{fname}_field_values);')
+
+        lines.append('')
+        lines.append('    CU_basic_set_mode(CU_BRM_VERBOSE);')
+        lines.append('    CU_basic_run_tests();')
+        lines.append('    failures = CU_get_number_of_failures();')
+        lines.append('    CU_cleanup_registry();')
+        lines.append('')
+        lines.append('    printf("\\n=== CUnit Summary ===\\n");')
+        lines.append('    printf("Tests run: %u\\n", CU_get_number_of_tests_run());')
+        lines.append('    printf("Failures: %u\\n", failures);')
+        lines.append('    printf("Result: %s\\n", failures == 0 ? "ALL PASSED" : "SOME FAILED");')
+        lines.append('')
+        lines.append('    return (failures > 0) ? 1 : 0;')
+        lines.append('}')
+        lines.append('')
+
+        return '\n'.join(lines)
+
+    def _simple_run_existing_test(self):
+        """加载已有的 CUnit 测试 .c 文件，与当前转换代码一起编译运行"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        code = self.simple_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有转换代码！请先生成代码。")
+            return
+
+        # 选择已有的测试 .c 文件
+        test_file_path = filedialog.askopenfilename(
+            title="选择已有的 CUnit 测试文件",
+            filetypes=[("C 文件", "*.c"), ("所有文件", "*.*")]
+        )
+        if not test_file_path:
+            return
+
+        try:
+            with open(test_file_path, 'r', encoding='utf-8') as f:
+                test_code = f.read()
+        except Exception as e:
+            messagebox.showerror("错误", f"读取测试文件失败: {e}")
+            return
+
+        if hasattr(self, 'simple_result_text'):
+            self.simple_result_text.delete('1.0', tk.END)
+            self.simple_result_text.insert('1.0', f"📂 加载测试文件: {test_file_path}\n", 'info')
+            self.simple_result_text.insert(tk.END, "🔨 正在编译...\n", 'info')
+            self.simple_result_text.update_idletasks()
+
+        self.status_var.set("📂 运行已有测试: 编译中...")
+        self.root.update_idletasks()
+
+        try:
+            import tempfile, subprocess
+
+            tmp_dir = tempfile.mkdtemp(prefix='cunit_existing_')
+
+            # 写入头文件
+            src_hdr = ""
+            tgt_hdr = ""
+            if hasattr(self, 'source_header_text'):
+                src_hdr = self.source_header_text.get('1.0', tk.END).strip()
+            if hasattr(self, 'target_header_text'):
+                tgt_hdr = self.target_header_text.get('1.0', tk.END).strip()
+            if not src_hdr and self.header_content:
+                src_hdr = self.header_content
+            if not tgt_hdr and self.target_header_content:
+                tgt_hdr = self.target_header_content
+
+            with open(os.path.join(tmp_dir, 'source.h'), 'w', encoding='utf-8') as f:
+                f.write(src_hdr or "/* source.h */\n")
+            with open(os.path.join(tmp_dir, 'target.h'), 'w', encoding='utf-8') as f:
+                f.write(tgt_hdr or "/* target.h */\n")
+
+            # 写入转换代码
+            converter_c = os.path.join(tmp_dir, 'converter.c')
+            converter_code = code
+            if '#include' not in code:
+                converter_code = (
+                    '#include <stdint.h>\n#include <string.h>\n'
+                    '#include "source.h"\n#include "target.h"\n\n' + code
+                )
+            with open(converter_c, 'w', encoding='utf-8') as f:
+                f.write(converter_code)
+
+            # 写入用户选择的测试代码
+            # 如果测试代码中没有 #include，自动添加
+            final_test_code = test_code
+            if '#include' not in test_code:
+                final_test_code = (
+                    '#include <stdio.h>\n#include <string.h>\n'
+                    '#include <CUnit/CUnit.h>\n#include <CUnit/Basic.h>\n'
+                    '#include "source.h"\n#include "target.h"\n\n' + test_code
+                )
+
+            # 检查测试代码中的 include 路径，替换为临时目录
+            final_test_code = final_test_code.replace(
+                '#include "source.h"', f'#include "source.h"'
+            )
+
+            test_c = os.path.join(tmp_dir, 'user_test.c')
+            with open(test_c, 'w', encoding='utf-8') as f:
+                f.write(final_test_code)
+
+            # 自动检测 CUnit 路径
+            cunit_inc, cunit_lib = self._detect_cunit_paths()
+
+            # 收集用户测试目录中可能需要的额外 .c 文件
+            test_dir = os.path.dirname(test_file_path)
+            extra_sources = []
+            for fname in os.listdir(test_dir):
+                if fname.endswith('.c') and fname != os.path.basename(test_file_path):
+                    fpath = os.path.join(test_dir, fname)
+                    # 检查是否引用了转换函数
+                    try:
+                        with open(fpath, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        if 'convert_' in content or '#include' in content:
+                            extra_sources.append(fpath)
+                    except Exception:
+                        pass
+
+            # 编译
+            exe_file = os.path.join(tmp_dir, 'test_runner.exe')
+            compile_cmd = [
+                'gcc', '-Wall', '-Wextra', '-std=c11',
+                '-I' + tmp_dir,
+                test_c, converter_c,
+            ]
+            compile_cmd.extend(extra_sources)
+            compile_cmd.extend(['-o', exe_file, '-lm'])
+
+            if cunit_inc:
+                compile_cmd.insert(1, '-I' + cunit_inc)
+            if cunit_lib:
+                compile_cmd.extend(['-L' + cunit_lib])
+            compile_cmd.extend(['-lcunit'])
+
+            self.status_var.set("📂 运行已有测试: gcc 编译中...")
+            self.root.update_idletasks()
+
+            compile_result = subprocess.run(
+                compile_cmd, capture_output=True, text=True, timeout=30, cwd=tmp_dir
+            )
+
+            if compile_result.returncode != 0:
+                err_output = f"❌ 编译失败\n\n测试文件: {test_file_path}\n\n"
+                if compile_result.stderr:
+                    err_output += compile_result.stderr
+                self._show_result(err_output, 'error')
+                self.status_var.set("❌ 编译失败")
+                return
+
+            # 运行
+            self.status_var.set("📂 运行已有测试: 执行中...")
+            self.root.update_idletasks()
+
+            run_result = subprocess.run(
+                [exe_file], capture_output=True, text=True, timeout=30, cwd=tmp_dir
+            )
+
+            # 展示结果
+            output = f"📂 已有测试运行完成！\n"
+            output += f"测试文件: {test_file_path}\n\n"
+            if run_result.stdout:
+                output += "--- 运行输出 ---\n"
+                output += run_result.stdout
+            if run_result.stderr:
+                output += f"\n[stderr]\n{run_result.stderr}"
+            output += f"\n返回码: {run_result.returncode}"
+
+            tag = 'success' if run_result.returncode == 0 else 'error'
+            self._show_result(output, tag)
+            self.status_var.set("✅ 测试通过" if run_result.returncode == 0 else "⚠️ 测试有失败")
+
+        except subprocess.TimeoutExpired:
+            self._show_result("❌ 测试超时（30秒）", 'error')
+        except FileNotFoundError:
+            self._show_result("❌ 未找到 gcc 或 CUnit 库！\n请安装 gcc 和 cunit。", 'error')
+        except Exception as e:
+            self._show_result(f"❌ 异常: {e}", 'error')
+
+    def _simple_external_cunit_test(self):
+        """使用外部 CUnit 测试工具 (python-c-cunit-mc-dc) 对生成的代码进行测试"""
+        if not hasattr(self, 'simple_code_text'):
+            return
+        code = self.simple_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可测试的代码！请先生成代码。")
+            return
+
+        if hasattr(self, 'simple_result_text'):
+            self.simple_result_text.delete('1.0', tk.END)
+            self.simple_result_text.insert('1.0', "🔬 正在准备外部 CUnit 测试...\n", 'info')
+            self.simple_result_text.update_idletasks()
+
+        self.status_var.set("🔬 外部 CUnit 测试: 准备中...")
+        self.root.update_idletasks()
+
+        # CUnit 工具路径
+        cunit_tool_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'python-c-cunit-mc-dc', 'outputs'
+        )
+        cunit_tool_path = os.path.join(cunit_tool_dir, 'cunit_mcdc_tool.py')
+
+        if not os.path.exists(cunit_tool_path):
+            cunit_tool_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                '..', 'python-c-cunit-mc-dc', 'outputs'
+            )
+            cunit_tool_path = os.path.join(cunit_tool_dir, 'cunit_mcdc_tool.py')
+
+        if not os.path.exists(cunit_tool_path):
+            self._show_result("❌ 未找到外部 CUnit 测试工具！\n"
+                              "请确保 python-c-cunit-mc-dc/outputs/cunit_mcdc_tool.py 存在。", 'error')
+            return
+
+        try:
+            import tempfile, subprocess, json
+
+            tmp_dir = tempfile.mkdtemp(prefix='cunit_ext_')
+            src_dir = os.path.join(tmp_dir, 'src')
+            tests_dir = os.path.join(tmp_dir, 'tests')
+            os.makedirs(src_dir)
+            os.makedirs(tests_dir)
+
+            src_file = os.path.join(src_dir, 'generated_code.c')
+            with open(src_file, 'w', encoding='utf-8') as f:
+                f.write(code)
+
+            if self.header_content:
+                hdr_file = os.path.join(src_dir, 'header_context.h')
+                with open(hdr_file, 'w', encoding='utf-8') as f:
+                    f.write(self.header_content)
+
+            config = {
+                "project_root": tmp_dir,
+                "source_globs": ["src/**/*.c", "src/**/*.h"],
+                "include_dirs": [src_dir],
+                "test_output_dir": tests_dir,
+                "compiler": "gcc",
+                "c_standard": "c11",
+                "auto_build": True,
+                "llm_base_url": self.llm_service.base_url,
+                "llm_model": self.llm_service.model,
+                "llm_api_key_env": "CUNIT_API_KEY",
+                "llm_max_tokens": 4096,
+                "max_llm_rounds": 1
+            }
+
+            config_file = os.path.join(tmp_dir, 'config.json')
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+
+            env = os.environ.copy()
+            env['CUNIT_API_KEY'] = self.llm_service.api_key
+
+            self.status_var.set("🔬 外部 CUnit: AI 正在生成测试用例...")
+            self.root.update_idletasks()
+
+            cmd = [sys.executable, cunit_tool_path, '--config', config_file, 'generate-functions']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=tmp_dir, env=env)
+
+            if result.returncode == 0:
+                output = "✅ 外部 CUnit 测试生成成功！\n\n"
+                if result.stdout:
+                    output += result.stdout[-2000:]
+
+                test_file = os.path.join(tests_dir, 'auto_mcdc_tests.c')
+                if os.path.exists(test_file):
+                    output += f"\n📄 测试文件: {test_file}\n"
+                    self.status_var.set("🔬 外部 CUnit: 编译并运行...")
+                    self.root.update_idletasks()
+
+                    run_cmd = [sys.executable, cunit_tool_path, '--config', config_file, 'run']
+                    run_result = subprocess.run(run_cmd, capture_output=True, text=True, timeout=60, cwd=tmp_dir, env=env)
+                    if run_result.stdout:
+                        output += f"\n--- 测试运行结果 ---\n{run_result.stdout[-2000:]}\n"
+                    if run_result.stderr:
+                        output += f"\n--- 错误输出 ---\n{run_result.stderr[-1000:]}\n"
+
+                self._show_result(output, 'success')
+                self.status_var.set("✅ 外部 CUnit 测试完成")
+            else:
+                output = f"❌ 外部 CUnit 测试失败 (返回码: {result.returncode})\n\n"
+                if result.stdout:
+                    output += f"标准输出:\n{result.stdout[-2000:]}\n"
+                if result.stderr:
+                    output += f"\n错误输出:\n{result.stderr[-2000:]}\n"
+                self._show_result(output, 'error')
+                self.status_var.set("❌ 外部 CUnit 测试失败")
+
+        except subprocess.TimeoutExpired:
+            self._show_result("❌ 外部 CUnit 测试超时（180秒）", 'error')
+        except Exception as e:
+            self._show_result(f"❌ 外部 CUnit 测试异常: {e}", 'error')
+
+    def _save_mapping_doc(self):
+        """保存映射文档"""
+        content = ""
+        if self.current_mode == 'simple' and hasattr(self, 'simple_mapping_text'):
+            content = self.simple_mapping_text.get('1.0', tk.END).strip()
+        elif hasattr(self, 'mapping_doc_text'):
+            content = self.mapping_doc_text.get('1.0', tk.END).strip()
+
+        if not content:
+            messagebox.showwarning("警告", "映射文档为空！")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="保存映射文档",
+            defaultextension=".md",
+            filetypes=[("Markdown 文件", "*.md"), ("文本文件", "*.txt"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.mapping_doc_content = content
+            messagebox.showinfo("成功", f"映射文档已保存到: {file_path}")
+            self.status_var.set(f"映射文档已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def _load_mapping_doc(self):
+        """加载已有的映射文档"""
+        file_path = filedialog.askopenfilename(
+            title="加载映射文档",
+            filetypes=[
+                ("Markdown 文件", "*.md"),
+                ("文本文件", "*.txt"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+
+            self.mapping_doc_content = content
+
+            if self.current_mode == 'simple' and hasattr(self, 'simple_mapping_text'):
+                self.simple_mapping_text.delete('1.0', tk.END)
+                self.simple_mapping_text.insert('1.0', content)
+            elif hasattr(self, 'mapping_doc_text'):
+                self.mapping_doc_text.delete('1.0', tk.END)
+                self.mapping_doc_text.insert('1.0', content)
+
+            self.status_var.set(f"✅ 已加载映射文档: {os.path.basename(file_path)}")
+        except Exception as e:
+            messagebox.showerror("错误", f"加载映射文档失败: {e}")
+
+    def _export_to_advanced(self):
+        """将简单模式的映射文档导出到高级模式的映射列表"""
+        mapping_doc = self._get_current_simple_mapping_doc()
+        if not mapping_doc:
+            return
+
+        generator = DocumentBasedGenerator(
+            parser=self.parser,
+            target_parser=self.target_parser
+        )
+        imported_vars, imported_mappings = generator.parse_mappings_from_document(mapping_doc)
+
+        if not imported_mappings:
+            messagebox.showwarning("警告", "未能从映射文档中解析出映射关系！")
+            return
+
+        # 合并到高级模式数据
+        for v in imported_vars:
+            if not any(uv['name'] == v['name'] for uv in self.user_vars):
+                self.user_vars.append(v)
+
+        for m in imported_mappings:
+            already = any(
+                em['extern_member'] == m['extern_member'] and em['user_var'] == m['user_var']
+                for em in self.mappings
+            )
+            if not already:
+                self.mappings.append(m)
+
+        messagebox.showinfo(
+            "导出完成",
+            f"已导出 {len(imported_mappings)} 条映射关系和 {len(imported_vars)} 个变量到高级模式。\n"
+            f"切换到高级模式可查看和编辑。"
+        )
+        self.status_var.set(f"已导出到高级模式: {len(imported_mappings)} 条映射")
+
+    def _extract_mapping_doc_from_response(self, response: str) -> str:
+        """从 LLM 响应中提取映射文档内容"""
+        for pattern in [
+            r'```markdown\s*\n(.*?)```',
+            r'```md\s*\n(.*?)```',
+            r'```\s*\n(.*?)```',
+        ]:
+            match = re.search(pattern, response, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        return response.strip()
+
+    def _extract_code_from_llm_response(self, response: str) -> str:
+        """从 LLM 响应中提取代码块"""
+        patterns = [
+            r'```c\s*\n(.*?)```',
+            r'```C\s*\n(.*?)```',
+            r'```\s*\n(.*?)```',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, response, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        return response.strip()
 
     def _build_menu(self):
-        """构建菜单栏"""
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
 
         # 文件菜单
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="文件", menu=file_menu)
-        file_menu.add_command(label="打开头文件...", command=self._open_file, accelerator="Ctrl+O")
+        file_menu.add_command(label="📄 加载需求文档...", command=self._load_document, accelerator="Ctrl+O")
+        file_menu.add_command(label="📁 加载头文件(可选)...", command=self._load_header_file)
         file_menu.add_separator()
-        file_menu.add_command(label="导入映射配置...", command=self._import_config)
-        file_menu.add_command(label="导出映射配置...", command=self._export_config)
+        file_menu.add_command(label="📥 加载映射文档...", command=self._load_mapping_doc)
+        file_menu.add_command(label="📤 保存映射文档...", command=self._save_mapping_doc)
+        file_menu.add_separator()
+        file_menu.add_command(label="📂 导入映射配置(JSON)...", command=self._import_config)
+        file_menu.add_command(label="💾 导出映射配置(JSON)...", command=self._export_config)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.root.quit)
+
+        # 模式切换菜单
+        mode_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="模式", menu=mode_menu)
+        mode_menu.add_command(label="✅ 简单模式", command=lambda: self._switch_mode('simple'))
+        mode_menu.add_command(label="🔧 高级模式", command=lambda: self._switch_mode('advanced'))
 
         # 工具菜单
         tool_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="工具", menu=tool_menu)
-        tool_menu.add_command(label="生成赋值代码", command=self._generate_code)
-        tool_menu.add_command(label="复制生成的代码", command=self._copy_code)
+        tool_menu.add_command(label="🔗 测试 LLM 连接", command=self._test_llm_connection)
         tool_menu.add_separator()
-        tool_menu.add_command(label="清空所有映射", command=self._clear_mappings)
+        tool_menu.add_command(label="⚙️ LLM 服务设置...", command=self._show_llm_settings)
 
         # 帮助菜单
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -100,22 +2909,16 @@ class ExternMapperApp:
         help_menu.add_command(label="使用说明", command=self._show_help)
         help_menu.add_command(label="关于", command=self._show_about)
 
-        # 快捷键
-        self.root.bind('<Control-o>', lambda e: self._open_file())
+        self.root.bind('<Control-o>', lambda e: self._load_document())
 
-    # ── 主界面构建 ────────────────────────────────────────────────
+    def _build_advanced_mode(self, parent):
+        """构建高级模式 UI（原始完整界面）"""
+        main_paned = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+        main_paned.pack(fill=tk.BOTH, expand=True)
 
-    def _build_ui(self):
-        """构建主界面"""
-        # 主 PanedWindow（上下分割）
-        main_paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
-        main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # 上半部分：文件选择 + 变量选择 + 映射配置
         top_frame = ttk.Frame(main_paned)
         main_paned.add(top_frame, weight=3)
 
-        # 下半部分：代码预览
         bottom_frame = ttk.Frame(main_paned)
         main_paned.add(bottom_frame, weight=2)
 
@@ -123,32 +2926,25 @@ class ExternMapperApp:
         self._build_bottom_panel(bottom_frame)
 
     def _build_top_panel(self, parent):
-        """构建上半部分面板"""
-        # 使用 PanedWindow 水平分割
         h_paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         h_paned.pack(fill=tk.BOTH, expand=True)
 
-        # ── 左侧面板：文件选择 + Extern 变量列表 ──
         left_frame = ttk.LabelFrame(h_paned, text=" 📄 头文件 & Extern 变量 ", padding=5)
         h_paned.add(left_frame, weight=2)
 
         self._build_left_panel(left_frame)
 
-        # ── 中间面板：成员详情 ──
         center_frame = ttk.LabelFrame(h_paned, text=" 📋 变量成员详情 ", padding=5)
         h_paned.add(center_frame, weight=2)
 
         self._build_center_panel(center_frame)
 
-        # ── 右侧面板：用户变量 + 映射配置 ──
         right_frame = ttk.LabelFrame(h_paned, text=" 🔗 映射配置 ", padding=5)
         h_paned.add(right_frame, weight=3)
 
         self._build_right_panel(right_frame)
 
     def _build_left_panel(self, parent):
-        """构建左侧面板：文件选择和 extern 变量列表"""
-        # 文件选择区域
         file_frame = ttk.Frame(parent)
         file_frame.pack(fill=tk.X, pady=(0, 5))
 
@@ -157,17 +2953,23 @@ class ExternMapperApp:
         self.file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(file_frame, text="浏览...", command=self._open_file).pack(side=tk.LEFT)
 
-        # Extern 变量列表
+        target_frame = ttk.Frame(parent)
+        target_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(target_frame, text="目标文件:", style='Info.TLabel').pack(side=tk.LEFT)
+        self.target_file_entry = ttk.Entry(target_frame, textvariable=self.target_file, state='readonly')
+        self.target_file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(target_frame, text="浏览...", command=self._open_target_file).pack(side=tk.LEFT)
+
         list_frame = ttk.Frame(parent)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(list_frame, text="Extern 变量列表:", style='Header.TLabel').pack(anchor=tk.W)
 
-        # Treeview 显示 extern 变量
         columns = ('name', 'type', 'is_struct')
         self.extern_tree = ttk.Treeview(
             list_frame, columns=columns, show='headings',
-            selectmode='browse', height=10
+            selectmode='browse', height=8
         )
         self.extern_tree.heading('name', text='变量名')
         self.extern_tree.heading('type', text='类型')
@@ -184,19 +2986,20 @@ class ExternMapperApp:
 
         self.extern_tree.bind('<<TreeviewSelect>>', self._on_extern_select)
 
-        # 解析信息
         self.parse_info_var = tk.StringVar(value="尚未加载头文件")
         ttk.Label(parent, textvariable=self.parse_info_var, style='Warning.TLabel').pack(
             anchor=tk.W, pady=(5, 0)
         )
 
+        self.target_info_var = tk.StringVar(value="尚未加载目标头文件")
+        ttk.Label(parent, textvariable=self.target_info_var, style='Warning.TLabel').pack(
+            anchor=tk.W, pady=(2, 0)
+        )
+
     def _build_center_panel(self, parent):
-        """构建中间面板：变量成员详情"""
-        # 成员详情标题
         self.member_title_var = tk.StringVar(value="选择一个 extern 变量查看成员")
         ttk.Label(parent, textvariable=self.member_title_var, style='Header.TLabel').pack(anchor=tk.W)
 
-        # 成员 Treeview
         columns = ('name', 'type', 'array', 'pointer', 'bitfield')
         self.member_tree = ttk.Treeview(
             parent, columns=columns, show='headings',
@@ -222,26 +3025,25 @@ class ExternMapperApp:
         self.member_tree.bind('<<TreeviewSelect>>', self._on_member_select)
 
     def _build_right_panel(self, parent):
-        """构建右侧面板：用户变量定义和映射配置"""
-        # 使用 Notebook 分页
         notebook = ttk.Notebook(parent)
         notebook.pack(fill=tk.BOTH, expand=True)
 
-        # ── Tab 1: 用户变量定义 ──
         user_var_tab = ttk.Frame(notebook, padding=5)
         notebook.add(user_var_tab, text=" 👤 用户变量 ")
 
         self._build_user_var_tab(user_var_tab)
 
-        # ── Tab 2: 映射配置 ──
+        target_var_tab = ttk.Frame(notebook, padding=5)
+        notebook.add(target_var_tab, text=" 🎯 目标头文件变量 ")
+
+        self._build_target_var_tab(target_var_tab)
+
         mapping_tab = ttk.Frame(notebook, padding=5)
         notebook.add(mapping_tab, text=" 🔗 映射关系 ")
 
         self._build_mapping_tab(mapping_tab)
 
     def _build_user_var_tab(self, parent):
-        """构建用户变量定义标签页"""
-        # 添加用户变量区域
         add_frame = ttk.LabelFrame(parent, text="添加用户变量", padding=5)
         add_frame.pack(fill=tk.X, pady=(0, 5))
 
@@ -261,14 +3063,19 @@ class ExternMapperApp:
         )
         self.user_var_type.set('int')
         self.user_var_type.pack(side=tk.LEFT, padx=5)
+        self.user_var_type.bind('<<ComboboxSelected>>', self._on_user_var_type_changed)
 
         row2 = ttk.Frame(add_frame)
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="自定义类型:").pack(side=tk.LEFT)
-        self.user_var_custom_type = ttk.Entry(row2, width=20)
+        self.user_var_custom_type = ttk.Entry(row2, width=14)
         self.user_var_custom_type.pack(side=tk.LEFT, padx=5)
+        ttk.Label(row2, text="结构体类型:").pack(side=tk.LEFT)
+        self.struct_type_combo = ttk.Combobox(row2, width=14, state='readonly')
+        self.struct_type_combo.pack(side=tk.LEFT, padx=5)
+        self.struct_type_combo.bind('<<ComboboxSelected>>', self._on_struct_type_selected)
         ttk.Label(row2, text="描述:").pack(side=tk.LEFT)
-        self.user_var_desc = ttk.Entry(row2, width=20)
+        self.user_var_desc = ttk.Entry(row2, width=14)
         self.user_var_desc.pack(side=tk.LEFT, padx=5)
 
         btn_frame = ttk.Frame(add_frame)
@@ -276,12 +3083,12 @@ class ExternMapperApp:
         ttk.Button(btn_frame, text="➕ 添加变量", command=self._add_user_var, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="🗑️ 删除选中", command=self._del_user_var).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="📋 批量添加", command=self._batch_add_user_var).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="📦 从结构体添加", command=self._add_from_struct, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
 
-        # 用户变量列表
         list_frame = ttk.Frame(parent)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('name', 'type', 'desc')
+        columns = ('name', 'type', 'desc', 'source')
         self.user_var_tree = ttk.Treeview(
             list_frame, columns=columns, show='headings',
             selectmode='browse', height=8
@@ -289,9 +3096,11 @@ class ExternMapperApp:
         self.user_var_tree.heading('name', text='变量名')
         self.user_var_tree.heading('type', text='类型')
         self.user_var_tree.heading('desc', text='描述')
+        self.user_var_tree.heading('source', text='来源')
         self.user_var_tree.column('name', width=120, minwidth=80)
         self.user_var_tree.column('type', width=120, minwidth=80)
-        self.user_var_tree.column('desc', width=150, minwidth=80)
+        self.user_var_tree.column('desc', width=120, minwidth=60)
+        self.user_var_tree.column('source', width=80, minwidth=50)
 
         uv_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.user_var_tree.yview)
         self.user_var_tree.configure(yscrollcommand=uv_scroll.set)
@@ -299,27 +3108,82 @@ class ExternMapperApp:
         self.user_var_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         uv_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def _build_target_var_tab(self, parent):
+        info_frame = ttk.LabelFrame(parent, text="目标头文件变量", padding=5)
+        info_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(info_frame, text="选择目标头文件中的变量作为映射目标变量", style='Info.TLabel').pack(anchor=tk.W)
+
+        btn_frame = ttk.Frame(info_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="📥 导入选中变量到用户变量", command=self._import_target_vars, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="📥 导入全部变量", command=self._import_all_target_vars).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="📦 导入结构体成员", command=self._import_target_struct_members, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+
+        target_list_frame = ttk.Frame(parent)
+        target_list_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ('name', 'type', 'is_struct', 'struct_type')
+        self.target_var_tree = ttk.Treeview(
+            target_list_frame, columns=columns, show='headings',
+            selectmode='extended', height=8
+        )
+        self.target_var_tree.heading('name', text='变量名')
+        self.target_var_tree.heading('type', text='类型')
+        self.target_var_tree.heading('is_struct', text='结构体')
+        self.target_var_tree.heading('struct_type', text='结构体类型')
+        self.target_var_tree.column('name', width=120, minwidth=80)
+        self.target_var_tree.column('type', width=140, minwidth=80)
+        self.target_var_tree.column('is_struct', width=60, minwidth=40, anchor=tk.CENTER)
+        self.target_var_tree.column('struct_type', width=120, minwidth=80)
+
+        target_scroll = ttk.Scrollbar(target_list_frame, orient=tk.VERTICAL, command=self.target_var_tree.yview)
+        self.target_var_tree.configure(yscrollcommand=target_scroll.set)
+
+        self.target_var_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        target_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.target_var_tree.bind('<<TreeviewSelect>>', self._on_target_var_select)
+
+        self.target_member_frame = ttk.LabelFrame(parent, text="目标变量成员详情", padding=5)
+        self.target_member_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        tm_columns = ('name', 'type', 'array', 'pointer')
+        self.target_member_tree = ttk.Treeview(
+            self.target_member_frame, columns=tm_columns, show='headings',
+            selectmode='extended', height=6
+        )
+        self.target_member_tree.heading('name', text='成员名')
+        self.target_member_tree.heading('type', text='类型')
+        self.target_member_tree.heading('array', text='数组')
+        self.target_member_tree.heading('pointer', text='指针')
+        self.target_member_tree.column('name', width=120, minwidth=80)
+        self.target_member_tree.column('type', width=120, minwidth=80)
+        self.target_member_tree.column('array', width=60, minwidth=40, anchor=tk.CENTER)
+        self.target_member_tree.column('pointer', width=60, minwidth=40, anchor=tk.CENTER)
+
+        tm_scroll = ttk.Scrollbar(self.target_member_frame, orient=tk.VERTICAL, command=self.target_member_tree.yview)
+        self.target_member_tree.configure(yscrollcommand=tm_scroll.set)
+
+        self.target_member_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tm_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
     def _build_mapping_tab(self, parent):
-        """构建映射配置标签页"""
-        # 添加映射区域
         add_map_frame = ttk.LabelFrame(parent, text="添加映射关系", padding=5)
         add_map_frame.pack(fill=tk.X, pady=(0, 5))
 
-        # 第一行：选择 extern 成员
         row_ext = ttk.Frame(add_map_frame)
         row_ext.pack(fill=tk.X, pady=2)
         ttk.Label(row_ext, text="Extern 成员:").pack(side=tk.LEFT)
         self.map_extern_member = ttk.Combobox(row_ext, width=25, state='readonly')
         self.map_extern_member.pack(side=tk.LEFT, padx=5)
 
-        # 第二行：选择用户变量
         row_user = ttk.Frame(add_map_frame)
         row_user.pack(fill=tk.X, pady=2)
         ttk.Label(row_user, text="用户变量:").pack(side=tk.LEFT)
         self.map_user_var = ttk.Combobox(row_user, width=25, state='readonly')
         self.map_user_var.pack(side=tk.LEFT, padx=5)
 
-        # 第三行：赋值/判断
         row_op = ttk.Frame(add_map_frame)
         row_op.pack(fill=tk.X, pady=2)
         ttk.Label(row_op, text="操作类型:").pack(side=tk.LEFT)
@@ -331,14 +3195,11 @@ class ExternMapperApp:
         self.map_op_type.pack(side=tk.LEFT, padx=5)
         self.map_op_type.bind('<<ComboboxSelected>>', self._on_op_type_changed)
 
-        # 第四行：条件/表达式
-        self.map_condition_frame = ttk.Frame(add_map_frame)
+        self.map_condition_frame = ttk.LabelFrame(add_map_frame, text="条件表达式 (支持与/或)", padding=5)
         self.map_condition_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(self.map_condition_frame, text="条件/表达式:").pack(side=tk.LEFT)
-        self.map_condition = ttk.Entry(self.map_condition_frame, width=40)
-        self.map_condition.pack(side=tk.LEFT, padx=5)
 
-        # 第五行：转换规则
+        self._build_condition_builder()
+
         row_conv = ttk.Frame(add_map_frame)
         row_conv.pack(fill=tk.X, pady=2)
         ttk.Label(row_conv, text="转换规则:").pack(side=tk.LEFT)
@@ -352,19 +3213,18 @@ class ExternMapperApp:
         self.map_custom_conv = ttk.Entry(row_conv, width=20)
         self.map_custom_conv.pack(side=tk.LEFT, padx=5)
 
-        # 添加按钮
         btn_frame = ttk.Frame(add_map_frame)
         btn_frame.pack(fill=tk.X, pady=5)
         ttk.Button(btn_frame, text="➕ 添加映射", command=self._add_mapping, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="🗑️ 删除选中", command=self._del_mapping).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="⬆️ 上移", command=lambda: self._move_mapping(-1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="⬇️ 下移", command=lambda: self._move_mapping(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="⚡ 自动匹配", command=self._auto_match, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
 
-        # 映射列表
         map_list_frame = ttk.Frame(parent)
         map_list_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('extern_member', 'operator', 'user_var', 'conversion', 'condition')
+        columns = ('extern_member', 'operator', 'user_var', 'conversion', 'condition_count')
         self.mapping_tree = ttk.Treeview(
             map_list_frame, columns=columns, show='headings',
             selectmode='browse', height=8
@@ -373,12 +3233,12 @@ class ExternMapperApp:
         self.mapping_tree.heading('operator', text='操作')
         self.mapping_tree.heading('user_var', text='用户变量')
         self.mapping_tree.heading('conversion', text='转换规则')
-        self.mapping_tree.heading('condition', text='条件/表达式')
+        self.mapping_tree.heading('condition_count', text='条件数')
         self.mapping_tree.column('extern_member', width=120, minwidth=80)
         self.mapping_tree.column('operator', width=80, minwidth=50)
         self.mapping_tree.column('user_var', width=100, minwidth=60)
         self.mapping_tree.column('conversion', width=80, minwidth=50)
-        self.mapping_tree.column('condition', width=150, minwidth=80)
+        self.mapping_tree.column('condition_count', width=60, minwidth=40, anchor=tk.CENTER)
 
         map_scroll = ttk.Scrollbar(map_list_frame, orient=tk.VERTICAL, command=self.mapping_tree.yview)
         self.mapping_tree.configure(yscrollcommand=map_scroll.set)
@@ -388,12 +3248,140 @@ class ExternMapperApp:
 
         self.mapping_tree.bind('<<TreeviewSelect>>', self._on_mapping_select)
 
+    def _build_condition_builder(self):
+        """构建条件表达式输入界面"""
+        cond_row1 = ttk.Frame(self.map_condition_frame)
+        cond_row1.pack(fill=tk.X, pady=2)
+
+        ttk.Label(cond_row1, text="变量:").pack(side=tk.LEFT)
+        self.cond_var_ref = ttk.Combobox(cond_row1, width=15, state='readonly')
+        self.cond_var_ref.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(cond_row1, text="操作符:").pack(side=tk.LEFT)
+        self.cond_operator = ttk.Combobox(
+            cond_row1, width=8, state='readonly',
+            values=['==', '!=', '>', '<', '>=', '<=', '&&', '||']
+        )
+        self.cond_operator.set('==')
+        self.cond_operator.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(cond_row1, text="值:").pack(side=tk.LEFT)
+        self.cond_value = ttk.Entry(cond_row1, width=15)
+        self.cond_value.pack(side=tk.LEFT, padx=5)
+
+        cond_row2 = ttk.Frame(self.map_condition_frame)
+        cond_row2.pack(fill=tk.X, pady=2)
+
+        ttk.Label(cond_row2, text="逻辑连接:").pack(side=tk.LEFT)
+        self.cond_logic = ttk.Combobox(
+            cond_row2, width=8, state='readonly',
+            values=['AND', 'OR']
+        )
+        self.cond_logic.set('AND')
+        self.cond_logic.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(cond_row2, text="➕ 添加条件", command=self._add_condition).pack(side=tk.LEFT, padx=5)
+        ttk.Button(cond_row2, text="🗑️ 清空", command=self._clear_conditions).pack(side=tk.LEFT, padx=2)
+
+        self.cond_preview_frame = ttk.LabelFrame(self.map_condition_frame, text="条件预览", padding=5)
+        self.cond_preview_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        self.cond_preview_text = tk.Text(
+            self.cond_preview_frame, height=4, font=('Consolas', 9),
+            wrap=tk.WORD, bg='#f5f5f5'
+        )
+        self.cond_preview_text.pack(fill=tk.BOTH, expand=True)
+
+        self.current_conditions: List[Dict] = []
+
+    def _add_condition(self):
+        """添加一个条件到当前条件列表"""
+        var_ref = self.cond_var_ref.get()
+        operator = self.cond_operator.get()
+        value = self.cond_value.get().strip()
+        logic = self.cond_logic.get()
+
+        if not var_ref:
+            messagebox.showwarning("警告", "请选择变量！")
+            return
+        if not value:
+            messagebox.showwarning("警告", "请输入比较值！")
+            return
+
+        self.current_conditions.append({
+            'var_ref': var_ref,
+            'operator': operator,
+            'value': value,
+            'logic': logic if len(self.current_conditions) > 0 else ''
+        })
+
+        self._update_condition_preview()
+        self.cond_value.delete(0, tk.END)
+
+    def _clear_conditions(self):
+        """清空所有条件"""
+        self.current_conditions.clear()
+        self._update_condition_preview()
+
+    def _update_condition_preview(self):
+        """更新条件预览"""
+        self.cond_preview_text.delete('1.0', tk.END)
+
+        if not self.current_conditions:
+            self.cond_preview_text.insert('1.0', "(无条件)")
+            return
+
+        ext_var = self._get_extern_var_name()
+        expr_parts = []
+
+        for i, cond in enumerate(self.current_conditions):
+            var_full = f"{ext_var}->{cond['var_ref']}"
+            expr = f"{var_full} {cond['operator']} {cond['value']}"
+            expr_parts.append(expr)
+
+        if len(expr_parts) == 1:
+            result = expr_parts[0]
+        else:
+            result = expr_parts[0]
+            for i in range(1, len(expr_parts)):
+                logic = self.current_conditions[i].get('logic', 'AND')
+                result += f"\n{logic} ({expr_parts[i]})"
+
+        self.cond_preview_text.insert('1.0', result)
+
+    def _get_extern_var_name(self) -> str:
+        if self.selected_extern_var:
+            return self.selected_extern_var['name']
+        return "ext_var"
+
     def _build_bottom_panel(self, parent):
-        """构建下半部分面板：代码预览"""
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        code_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(code_frame, text=" 💻 生成的代码 ")
+
+        self._build_code_tab(code_frame)
+
+        md_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(md_frame, text=" 📝 Markdown 文档 ")
+
+        self._build_markdown_tab(md_frame)
+
+        ai_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(ai_frame, text=" 🤖 AI 代码生成 ")
+
+        self._build_ai_tab(ai_frame)
+
+        doc_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(doc_frame, text=" 📋 映射文档工作流 ")
+
+        self._build_doc_tab(doc_frame)
+
+    def _build_code_tab(self, parent):
         code_frame = ttk.LabelFrame(parent, text=" 📝 生成的代码 ", padding=5)
         code_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 工具栏
         toolbar = ttk.Frame(code_frame)
         toolbar.pack(fill=tk.X, pady=(0, 5))
 
@@ -409,7 +3397,6 @@ class ExternMapperApp:
         self.code_template.set('赋值函数')
         self.code_template.pack(side=tk.LEFT, padx=5)
 
-        # 代码预览区
         self.code_text = scrolledtext.ScrolledText(
             code_frame, wrap=tk.NONE, font=('Consolas', 10),
             bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
@@ -417,7 +3404,6 @@ class ExternMapperApp:
         )
         self.code_text.pack(fill=tk.BOTH, expand=True)
 
-        # 添加行号和语法高亮标签
         self.code_text.tag_configure('keyword', foreground='#569cd6')
         self.code_text.tag_configure('type', foreground='#4ec9b0')
         self.code_text.tag_configure('string', foreground='#ce9178')
@@ -425,10 +3411,1064 @@ class ExternMapperApp:
         self.code_text.tag_configure('number', foreground='#b5cea8')
         self.code_text.tag_configure('function', foreground='#dcdcaa')
 
-    # ── 文件操作 ──────────────────────────────────────────────────
+    def _build_markdown_tab(self, parent):
+        md_frame = ttk.LabelFrame(parent, text=" 📝 Markdown 文档 ", padding=5)
+        md_frame.pack(fill=tk.BOTH, expand=True)
+
+        toolbar = ttk.Frame(md_frame)
+        toolbar.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(toolbar, text="📄 生成文档", command=self._generate_markdown, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📋 复制文档", command=self._copy_markdown).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="💾 保存文档...", command=self._save_markdown).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📋 复制代码+文档", command=self._copy_code_and_markdown).pack(side=tk.LEFT, padx=2)
+
+        self.md_text = scrolledtext.ScrolledText(
+            md_frame, wrap=tk.WORD, font=('Consolas', 10),
+            bg='#ffffff', fg='#333333', height=12
+        )
+        self.md_text.pack(fill=tk.BOTH, expand=True)
+
+    def _build_ai_tab(self, parent):
+        """构建 AI 代码生成标签页"""
+        ai_frame = ttk.LabelFrame(parent, text=" 🤖 AI 大模型代码生成 ", padding=5)
+        ai_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 状态信息
+        status_frame = ttk.Frame(ai_frame)
+        status_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.ai_status_var = tk.StringVar(value="未配置 LLM 服务")
+        ttk.Label(status_frame, textvariable=self.ai_status_var, style='Warning.TLabel').pack(side=tk.LEFT)
+        ttk.Button(status_frame, text="⚙️ 设置", command=self._show_llm_settings).pack(side=tk.RIGHT, padx=2)
+
+        # 操作按钮
+        toolbar = ttk.Frame(ai_frame)
+        toolbar.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(toolbar, text="🧠 AI 生成映射代码", command=self._llm_generate_code,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📋 复制结果", command=self._copy_ai_code).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="💾 保存结果...", command=self._save_ai_code).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📋 复制到代码标签页", command=self._copy_ai_to_code_tab).pack(side=tk.LEFT, padx=2)
+
+        # 提示信息
+        info_label = ttk.Label(
+            ai_frame,
+            text="提示: AI 将基于当前映射关系和头文件内容生成 C 语言转换代码。请先配置 LLM 服务。",
+            style='Info.TLabel', wraplength=600
+        )
+        info_label.pack(fill=tk.X, pady=(0, 5))
+
+        # AI 输出文本框
+        self.ai_code_text = scrolledtext.ScrolledText(
+            ai_frame, wrap=tk.NONE, font=('Consolas', 10),
+            bg='#1a1a2e', fg='#e0e0e0', insertbackground='white',
+            selectbackground='#264f78', height=12
+        )
+        self.ai_code_text.pack(fill=tk.BOTH, expand=True)
+
+        self.ai_code_text.tag_configure('keyword', foreground='#569cd6')
+        self.ai_code_text.tag_configure('type', foreground='#4ec9b0')
+        self.ai_code_text.tag_configure('string', foreground='#ce9178')
+        self.ai_code_text.tag_configure('comment', foreground='#6a9955')
+        self.ai_code_text.tag_configure('error', foreground='#f44747')
+        self.ai_code_text.tag_configure('success', foreground='#4ec9b0')
+
+        # 更新状态
+        self._update_ai_status()
+
+    def _build_doc_tab(self, parent):
+        """构建映射文档工作流标签页 - 三阶段工作流"""
+        doc_frame = ttk.LabelFrame(parent, text=" 📋 映射文档工作流（自然语言→映射文档→代码） ", padding=5)
+        doc_frame.pack(fill=tk.BOTH, expand=True)
+
+        # ── 阶段1: 输入 ──
+        stage1_lf = ttk.LabelFrame(doc_frame, text=" 阶段1: 输入（自然语言文档 + 头文件）", padding=5)
+        stage1_lf.pack(fill=tk.X, pady=(0, 3))
+
+        # 文档选择
+        doc_row1 = ttk.Frame(stage1_lf)
+        doc_row1.pack(fill=tk.X, pady=2)
+
+        ttk.Label(doc_row1, text="需求文档:", style='Info.TLabel').pack(side=tk.LEFT)
+        self.doc_file_var = tk.StringVar(value="未加载文档")
+        ttk.Entry(doc_row1, textvariable=self.doc_file_var, state='readonly',
+                  width=35).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(doc_row1, text="📄 加载文档", command=self._load_document).pack(side=tk.LEFT, padx=2)
+        ttk.Button(doc_row1, text="🗑️ 清除", command=self._clear_document).pack(side=tk.LEFT, padx=2)
+
+        # 头文件选择
+        doc_row2 = ttk.Frame(stage1_lf)
+        doc_row2.pack(fill=tk.X, pady=2)
+
+        ttk.Label(doc_row2, text="关联头文件:", style='Info.TLabel').pack(side=tk.LEFT)
+        self.doc_header_var = tk.StringVar(value="")
+        self.doc_header_combo = ttk.Combobox(
+            doc_row2, textvariable=self.doc_header_var,
+            width=35, state='readonly'
+        )
+        self.doc_header_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(doc_row2, text="📂 浏览...", command=self._browse_doc_header).pack(side=tk.LEFT, padx=2)
+
+        # 阶段1 操作按钮
+        doc_row3 = ttk.Frame(stage1_lf)
+        doc_row3.pack(fill=tk.X, pady=2)
+
+        ttk.Button(doc_row3, text="📤 从GUI映射导出映射文档",
+                   command=self._export_mapping_doc_from_gui,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(doc_row3, text="📂 加载映射文档...",
+                   command=self._import_mapping_doc).pack(side=tk.LEFT, padx=2)
+        ttk.Button(doc_row3, text="🤖 AI: 自然语言→映射文档",
+                   command=self._llm_doc_to_mapping_doc,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+
+        # ── 阶段2: 映射文档（中间产物）──
+        stage2_lf = ttk.LabelFrame(doc_frame, text=" 阶段2: 规范映射文档（中间产物，可编辑）", padding=3)
+        stage2_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 3))
+
+        # 映射文档工具栏
+        md_toolbar = ttk.Frame(stage2_lf)
+        md_toolbar.pack(fill=tk.X, pady=(0, 3))
+
+        ttk.Button(md_toolbar, text="💾 保存映射文档...", command=self._save_mapping_doc).pack(side=tk.LEFT, padx=2)
+        ttk.Button(md_toolbar, text="📥 导入映射到GUI", command=self._import_mapping_doc_to_gui).pack(side=tk.LEFT, padx=2)
+
+        self.mapping_doc_text = scrolledtext.ScrolledText(
+            stage2_lf, wrap=tk.WORD, font=('Consolas', 9),
+            bg='#f5f5dc', fg='#333333', height=6
+        )
+        self.mapping_doc_text.pack(fill=tk.BOTH, expand=True)
+
+        # ── 阶段3: 生成代码 ──
+        stage3_lf = ttk.LabelFrame(doc_frame, text=" 阶段3: 从映射文档生成代码", padding=3)
+        stage3_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 3))
+
+        # 阶段3 工具栏
+        code_toolbar = ttk.Frame(stage3_lf)
+        code_toolbar.pack(fill=tk.X, pady=(0, 3))
+
+        ttk.Button(code_toolbar, text="🤖 AI 生成代码",
+                   command=self._llm_mapping_doc_to_code,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="🐍 本地生成代码",
+                   command=self._local_mapping_doc_to_code,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=2)
+        ttk.Separator(code_toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        ttk.Button(code_toolbar, text="📋 复制代码", command=self._copy_doc_code).pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="💾 保存代码...", command=self._save_doc_code).pack(side=tk.LEFT, padx=2)
+        ttk.Button(code_toolbar, text="📋 复制到代码标签页", command=self._copy_doc_to_code_tab).pack(side=tk.LEFT, padx=2)
+
+        self.doc_code_text = scrolledtext.ScrolledText(
+            stage3_lf, wrap=tk.NONE, font=('Consolas', 10),
+            bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
+            selectbackground='#264f78', height=6
+        )
+        self.doc_code_text.pack(fill=tk.BOTH, expand=True)
+
+        self.doc_code_text.tag_configure('keyword', foreground='#569cd6')
+        self.doc_code_text.tag_configure('type', foreground='#4ec9b0')
+        self.doc_code_text.tag_configure('string', foreground='#ce9178')
+        self.doc_code_text.tag_configure('comment', foreground='#6a9955')
+        self.doc_code_text.tag_configure('error', foreground='#f44747')
+
+    # ──────────────────────────────────────────────
+    # LLM 配置管理
+    # ──────────────────────────────────────────────
+
+    def _load_llm_config(self):
+        """从 miapikey.txt 加载 LLM 设置（3行格式: key, url, model）"""
+        try:
+            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'miapikey.txt')
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                if len(lines) >= 1:
+                    self.llm_service.api_key = lines[0]
+                if len(lines) >= 2:
+                    self.llm_service.base_url = lines[1]
+                if len(lines) >= 3:
+                    self.llm_service.model = lines[2]
+        except Exception:
+            pass
+
+    def _save_llm_config(self):
+        """保存 LLM 设置到 miapikey.txt（3行格式: key, url, model）"""
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'miapikey.txt')
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.write(f"{self.llm_service.api_key}\n")
+                f.write(f"{self.llm_service.base_url}\n")
+                f.write(f"{self.llm_service.model}\n")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存 LLM 配置失败: {e}")
+
+    def _update_ai_status(self):
+        """更新 AI 状态显示"""
+        if hasattr(self, 'ai_status_var'):
+            if self.llm_service.is_configured():
+                self.ai_status_var.set(
+                    f"✅ 已配置: {self.llm_service.base_url} | 模型: {self.llm_service.model}"
+                )
+            else:
+                self.ai_status_var.set("⚠️ 未配置 LLM 服务 - 点击「设置」配置 API Key 和 URL")
+
+    def _show_llm_settings(self):
+        """显示 LLM 服务设置对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("LLM 服务设置")
+        dialog.geometry("620x580")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+        dialog.minsize(500, 500)
+
+        main_frame = ttk.Frame(dialog, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 标题
+        ttk.Label(main_frame, text="🤖 LLM 大模型服务配置",
+                  font=('Microsoft YaHei UI', 13, 'bold')).pack(anchor=tk.W, pady=(0, 10))
+
+        ttk.Label(main_frame, text="配置 OpenAI 兼容的 LLM API 服务，用于 AI 辅助代码生成。",
+                  style='Info.TLabel', wraplength=550).pack(anchor=tk.W, pady=(0, 15))
+
+        # API URL
+        url_frame = ttk.LabelFrame(main_frame, text="API Base URL", padding=8)
+        url_frame.pack(fill=tk.X, pady=(0, 8))
+
+        url_entry = ttk.Entry(url_frame, width=60)
+        url_entry.pack(fill=tk.X)
+        url_entry.insert(0, self.llm_service.base_url)
+
+        ttk.Label(url_frame, text="示例: https://api.openai.com/v1  或  http://localhost:8080/v1",
+                  style='Info.TLabel').pack(anchor=tk.W, pady=(3, 0))
+
+        # API Key
+        key_frame = ttk.LabelFrame(main_frame, text="API Key（可选，部分服务不需要）", padding=8)
+        key_frame.pack(fill=tk.X, pady=(0, 8))
+
+        key_entry = ttk.Entry(key_frame, width=60, show='*')
+        key_entry.pack(fill=tk.X)
+        key_entry.insert(0, self.llm_service.api_key)
+
+        show_var = tk.BooleanVar(value=False)
+
+        def toggle_key():
+            key_entry.config(show='' if show_var.get() else '*')
+
+        ttk.Checkbutton(key_frame, text="显示 API Key", variable=show_var,
+                        command=toggle_key).pack(anchor=tk.W, pady=(3, 0))
+
+        # 模型名称
+        model_frame = ttk.LabelFrame(main_frame, text="模型名称", padding=8)
+        model_frame.pack(fill=tk.X, pady=(0, 8))
+
+        model_entry = ttk.Entry(model_frame, width=60)
+        model_entry.pack(fill=tk.X)
+        model_entry.insert(0, self.llm_service.model)
+
+        model_hint = ttk.Label(
+            model_frame,
+            text="示例: gpt-4o, gpt-3.5-turbo, deepseek-chat, qwen-plus, glm-4 等",
+            style='Info.TLabel'
+        )
+        model_hint.pack(anchor=tk.W, pady=(3, 0))
+
+        # 预设按钮
+        preset_frame = ttk.LabelFrame(main_frame, text="快速预设", padding=8)
+        preset_frame.pack(fill=tk.X, pady=(0, 8))
+
+        presets = [
+            ("小米 MiMo", "https://token-plan-cn.xiaomimimo.com/v1", "MIMO-V2.5-Pro"),
+            ("OpenAI", "https://api.openai.com/v1", "gpt-4o"),
+            ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
+            ("通义千问", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+            ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4"),
+            ("本地 Ollama", "http://localhost:11434/v1", "qwen2.5"),
+        ]
+
+        preset_btn_frame = ttk.Frame(preset_frame)
+        preset_btn_frame.pack(fill=tk.X)
+
+        for i, (name, url, model) in enumerate(presets):
+            col = i % 3
+            row = i // 3
+            preset_btn_frame.columnconfigure(col, weight=1)
+            btn = ttk.Button(
+                preset_btn_frame, text=name,
+                command=lambda u=url, m=model: (
+                    url_entry.delete(0, tk.END), url_entry.insert(0, u),
+                    model_entry.delete(0, tk.END), model_entry.insert(0, m)
+                )
+            )
+            btn.grid(row=row, column=col, padx=3, pady=2, sticky='ew')
+
+        # 测试结果
+        self.test_result_var = tk.StringVar(value="")
+
+        # 按钮区域
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+
+        def do_test():
+            self.test_result_var.set("⏳ 正在测试连接...")
+            dialog.update_idletasks()
+
+            temp_service = LLMService(
+                api_key=key_entry.get().strip(),
+                base_url=url_entry.get().strip(),
+                model=model_entry.get().strip(),
+            )
+            success, msg = temp_service.test_connection()
+            if success:
+                self.test_result_var.set(f"✅ 连接成功: {msg[:100]}")
+            else:
+                self.test_result_var.set(f"❌ 连接失败: {msg[:200]}")
+
+        def do_save():
+            self.llm_service.base_url = url_entry.get().strip()
+            self.llm_service.api_key = key_entry.get().strip()
+            self.llm_service.model = model_entry.get().strip()
+            self._save_llm_config()
+            self._update_ai_status()
+            messagebox.showinfo("成功", "LLM 服务配置已保存！")
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="🔗 测试连接", command=do_test).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="💾 保存设置", command=do_save, style='Accent.TButton').pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=3)
+
+        ttk.Label(main_frame, textvariable=self.test_result_var,
+                  style='Info.TLabel', wraplength=550).pack(anchor=tk.W, pady=(5, 0))
+
+    def _test_llm_connection(self):
+        """测试 LLM 连接"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "请先配置 LLM 服务！")
+            self._show_llm_settings()
+            return
+
+        self.status_var.set("正在测试 LLM 连接...")
+        self.root.update_idletasks()
+
+        success, msg = self.llm_service.test_connection()
+        if success:
+            messagebox.showinfo("成功", f"LLM 连接测试成功！\n\n响应: {msg[:200]}")
+            self.status_var.set("LLM 连接测试成功")
+        else:
+            messagebox.showerror("失败", f"LLM 连接测试失败！\n\n{msg}")
+            self.status_var.set("LLM 连接测试失败")
+
+    # ──────────────────────────────────────────────
+    # AI 代码生成
+    # ──────────────────────────────────────────────
+
+    def _llm_generate_code(self):
+        """通过 LLM 基于当前映射关系生成代码"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "请先配置 LLM 服务！\n菜单: 🤖 AI 助手 → ⚙️ LLM 服务设置")
+            return
+
+        if not self.mappings:
+            messagebox.showwarning("警告", "请先添加映射关系！")
+            return
+
+        # 收集映射信息
+        mapping_info = self._build_mapping_info_text()
+
+        # 收集头文件内容
+        header_content = self._collect_header_content()
+
+        self.status_var.set("正在通过 AI 生成代码，请稍候...")
+        self.root.update_idletasks()
+
+        # 在后台线程中调用 LLM
+        def call_llm():
+            success, result = self.llm_service.generate_code_from_mapping(
+                mapping_info, header_content
+            )
+            # 在主线程中更新 UI
+            self.root.after(0, lambda: self._on_llm_code_result(success, result))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+
+    def _on_llm_code_result(self, success: bool, result: str):
+        """LLM 代码生成结果回调"""
+        if not hasattr(self, 'ai_code_text'):
+            return
+
+        self.ai_code_text.delete('1.0', tk.END)
+
+        if success:
+            # 提取代码块
+            code = self._extract_code_from_llm_response(result)
+            self.ai_code_text.insert('1.0', code)
+            self.status_var.set("✅ AI 代码生成完成")
+        else:
+            self.ai_code_text.insert('1.0', f"/* 生成失败 */\n/* {result} */")
+            self.status_var.set("❌ AI 代码生成失败")
+
+    def _build_mapping_info_text(self) -> str:
+        """构建映射关系的文本描述"""
+        lines = ["## 变量映射关系\n"]
+
+        if self.selected_extern_var:
+            lines.append(f"### 源 Extern 变量")
+            lines.append(f"- 名称: {self.selected_extern_var['name']}")
+            lines.append(f"- 类型: {self.selected_extern_var['type']}")
+            if self.selected_extern_var.get('is_struct'):
+                lines.append(f"- 结构体类型: {self.selected_extern_var.get('struct_type', '')}")
+            lines.append("")
+
+        lines.append("### 用户变量")
+        for v in self.user_vars:
+            lines.append(f"- `{v['name']}` : `{v['type']}` (来源: {v.get('source', '手动')})")
+        lines.append("")
+
+        lines.append("### 映射规则")
+        for i, m in enumerate(self.mappings, 1):
+            lines.append(f"{i}. 源成员 `{m['extern_member']}` → 目标变量 `{m['user_var']}`")
+            lines.append(f"   - 操作: {m['op_type']}")
+            lines.append(f"   - 转换: {m.get('conversion', '=')}")
+            if m.get('conv_rule') and m['conv_rule'] != '=':
+                lines.append(f"   - 转换规则: {m['conv_rule']}")
+            conditions = m.get('condition', [])
+            if conditions:
+                lines.append(f"   - 条件:")
+                for c in conditions:
+                    lines.append(f"     - {c.get('var_ref', '')} {c.get('operator', '')} {c.get('value', '')} ({c.get('logic', '')})")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _collect_header_content(self) -> str:
+        """收集当前加载的头文件内容"""
+        parts = []
+
+        source_file = self.current_file.get()
+        if source_file and os.path.exists(source_file):
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='replace') as f:
+                    parts.append(f"/* 源头文件: {os.path.basename(source_file)} */")
+                    parts.append(f"```c\n{f.read()}\n```")
+            except Exception:
+                pass
+
+        target_file = self.target_file.get()
+        if target_file and os.path.exists(target_file):
+            try:
+                with open(target_file, 'r', encoding='utf-8', errors='replace') as f:
+                    parts.append(f"\n/* 目标头文件: {os.path.basename(target_file)} */")
+                    parts.append(f"```c\n{f.read()}\n```")
+            except Exception:
+                pass
+
+        return "\n\n".join(parts) if parts else "（未加载头文件）"
+
+    def _copy_ai_code(self):
+        """复制 AI 生成的代码"""
+        if not hasattr(self, 'ai_code_text'):
+            return
+        code = self.ai_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可复制的内容！")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(code)
+        self.status_var.set("AI 生成代码已复制到剪贴板")
+
+    def _save_ai_code(self):
+        """保存 AI 生成的代码"""
+        if not hasattr(self, 'ai_code_text'):
+            return
+        code = self.ai_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可保存的内容！")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="保存 AI 生成代码",
+            defaultextension=".c",
+            filetypes=[("C 源文件", "*.c"), ("头文件", "*.h"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
+            messagebox.showinfo("成功", f"代码已保存到: {file_path}")
+            self.status_var.set(f"AI 代码已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def _copy_ai_to_code_tab(self):
+        """将 AI 生成代码复制到代码标签页"""
+        if not hasattr(self, 'ai_code_text'):
+            return
+        code = self.ai_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可复制的内容！")
+            return
+        self.code_text.delete('1.0', tk.END)
+        self.code_text.insert('1.0', code)
+        self._apply_syntax_highlighting()
+        self.status_var.set("已将 AI 生成代码复制到代码标签页")
+
+    # ──────────────────────────────────────────────
+    # 文档驱动代码生成
+    # ──────────────────────────────────────────────
+
+    # _load_document 已在简单模式部分定义，高级模式复用同一方法
+
+    def _import_mappings_from_doc(self):
+        """从文档导入映射关系到当前映射列表"""
+        file_path = filedialog.askopenfilename(
+            title="选择映射关系文档",
+            filetypes=[
+                ("Markdown 文件", "*.md"),
+                ("文本文件", "*.txt"),
+                ("CSV 文件", "*.csv"),
+                ("Word 文档", "*.docx"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            content = ""
+            ext = os.path.splitext(file_path)[1].lower()
+
+            if ext == '.docx':
+                try:
+                    from docx import Document as DocxDocument
+                    doc = DocxDocument(file_path)
+                    # 读取段落
+                    paragraphs = [p.text for p in doc.paragraphs]
+                    # 读取表格
+                    for table in doc.tables:
+                        for row in table.rows:
+                            cells = [cell.text for cell in row.cells]
+                            paragraphs.append(' | '.join(cells))
+                    content = "\n".join(paragraphs)
+                except ImportError:
+                    messagebox.showwarning(
+                        "提示",
+                        "读取 .docx 文件需要安装 python-docx 库。\n"
+                        "请运行: pip install python-docx\n\n"
+                        "您也可以将文档内容保存为 .txt 或 .md 格式后加载。"
+                    )
+                    return
+            else:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+
+            if not content.strip():
+                messagebox.showwarning("警告", "文档内容为空！")
+                return
+
+            # 使用 DocumentBasedGenerator 解析映射关系
+            generator = DocumentBasedGenerator(
+                parser=self.parser,
+                target_parser=self.target_parser
+            )
+            imported_vars, imported_mappings = generator.parse_mappings_from_document(content)
+
+            if not imported_mappings:
+                messagebox.showwarning(
+                    "警告",
+                    "未能从文档中解析出映射关系！\n\n"
+                    "请确保文档格式正确。支持的格式：\n"
+                    "• 源成员 -> 目标成员\n"
+                    "• 源成员 映射到 目标成员\n"
+                    "• Markdown 表格\n\n"
+                    "详细规则请参考《映射文档编写规则.md》"
+                )
+                return
+
+            # 显示导入预览对话框
+            self._show_import_preview(imported_vars, imported_mappings, file_path)
+
+        except Exception as e:
+            messagebox.showerror("错误", f"导入映射关系失败: {e}")
+
+    def _show_import_preview(self, imported_vars: List[Dict], imported_mappings: List[Dict],
+                              file_path: str):
+        """显示导入预览对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("导入映射关系预览")
+        dialog.geometry("750x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # 信息标签
+        info_frame = ttk.Frame(dialog, padding=5)
+        info_frame.pack(fill=tk.X)
+
+        ttk.Label(
+            info_frame,
+            text=f"📄 文件: {os.path.basename(file_path)}",
+            style='Info.TLabel'
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            info_frame,
+            text=f"✅ 解析到 {len(imported_vars)} 个变量, {len(imported_mappings)} 条映射关系",
+            style='Success.TLabel'
+        ).pack(anchor=tk.W)
+
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # 映射关系预览
+        map_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(map_frame, text=f" 映射关系 ({len(imported_mappings)}) ")
+
+        columns = ('source', 'target', 'op_type', 'conversion', 'condition')
+        preview_tree = ttk.Treeview(
+            map_frame, columns=columns, show='headings', height=12
+        )
+        preview_tree.heading('source', text='源成员')
+        preview_tree.heading('target', text='目标变量')
+        preview_tree.heading('op_type', text='操作类型')
+        preview_tree.heading('conversion', text='转换规则')
+        preview_tree.heading('condition', text='条件')
+        preview_tree.column('source', width=150, minwidth=80)
+        preview_tree.column('target', width=150, minwidth=80)
+        preview_tree.column('op_type', width=80, minwidth=60)
+        preview_tree.column('conversion', width=80, minwidth=50)
+        preview_tree.column('condition', width=150, minwidth=60)
+
+        scroll = ttk.Scrollbar(map_frame, orient=tk.VERTICAL, command=preview_tree.yview)
+        preview_tree.configure(yscrollcommand=scroll.set)
+        preview_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for m in imported_mappings:
+            cond_str = ''
+            conditions = m.get('condition', [])
+            if conditions:
+                cond_parts = []
+                for c in conditions:
+                    cond_parts.append(f"{c.get('var_ref', '')} {c.get('operator', '')} {c.get('value', '')}")
+                cond_str = ' AND '.join(cond_parts)
+            preview_tree.insert('', tk.END, values=(
+                m.get('extern_member', ''),
+                m.get('user_var', ''),
+                m.get('op_type', '直接赋值'),
+                m.get('conversion', '='),
+                cond_str
+            ))
+
+        # 变量预览
+        var_frame = ttk.Frame(notebook, padding=5)
+        notebook.add(var_frame, text=f" 用户变量 ({len(imported_vars)}) ")
+
+        var_columns = ('name', 'type', 'desc', 'source')
+        var_tree = ttk.Treeview(
+            var_frame, columns=var_columns, show='headings', height=10
+        )
+        var_tree.heading('name', text='变量名')
+        var_tree.heading('type', text='类型')
+        var_tree.heading('desc', text='描述')
+        var_tree.heading('source', text='来源')
+        var_tree.column('name', width=150, minwidth=80)
+        var_tree.column('type', width=100, minwidth=60)
+        var_tree.column('desc', width=200, minwidth=80)
+        var_tree.column('source', width=80, minwidth=50)
+
+        var_scroll = ttk.Scrollbar(var_frame, orient=tk.VERTICAL, command=var_tree.yview)
+        var_tree.configure(yscrollcommand=var_scroll.set)
+        var_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        var_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for v in imported_vars:
+            var_tree.insert('', tk.END, values=(
+                v.get('name', ''),
+                v.get('type', ''),
+                v.get('desc', ''),
+                v.get('source', '文档导入')
+            ))
+
+        # 选项
+        opt_frame = ttk.Frame(dialog, padding=5)
+        opt_frame.pack(fill=tk.X)
+
+        merge_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opt_frame, text="合并模式（保留现有映射，追加新映射）",
+            variable=merge_var
+        ).pack(anchor=tk.W)
+
+        import_vars_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opt_frame, text="同时导入解析到的用户变量",
+            variable=import_vars_var
+        ).pack(anchor=tk.W)
+
+        # 按钮
+        btn_frame = ttk.Frame(dialog, padding=5)
+        btn_frame.pack(fill=tk.X, pady=(5, 0))
+
+        def do_import():
+            do_merge = merge_var.get()
+            do_import_vars = import_vars_var.get()
+            count_maps = 0
+            count_vars = 0
+
+            if do_import_vars:
+                for v in imported_vars:
+                    if not any(uv['name'] == v['name'] for uv in self.user_vars):
+                        self.user_vars.append(v)
+                        count_vars += 1
+
+            if do_merge:
+                for m in imported_mappings:
+                    already = any(
+                        em['extern_member'] == m['extern_member'] and em['user_var'] == m['user_var']
+                        for em in self.mappings
+                    )
+                    if not already:
+                        self.mappings.append(m)
+                        count_maps += 1
+            else:
+                self.mappings = imported_mappings
+                count_maps = len(imported_mappings)
+
+            self._refresh_user_var_list()
+            self._update_user_var_combo()
+            self._refresh_mapping_list()
+
+            self.status_var.set(
+                f"从文档导入了 {count_maps} 条映射关系和 {count_vars} 个用户变量"
+            )
+            dialog.destroy()
+            messagebox.showinfo(
+                "导入完成",
+                f"成功导入:\n• 映射关系: {count_maps} 条\n• 用户变量: {count_vars} 个"
+            )
+
+        ttk.Button(btn_frame, text="✅ 确认导入", command=do_import,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def _clear_document(self):
+        """清除已加载的文档"""
+        self.doc_content = ""
+        self.doc_file_path = ""
+        self.doc_file_var.set("未加载文档")
+        self.status_var.set("已清除文档")
+
+    def _update_doc_header_combo(self):
+        """更新文档关联头文件下拉框"""
+        values = []
+        if self.current_file.get():
+            values.append(self.current_file.get())
+        if self.target_file.get():
+            values.append(self.target_file.get())
+        if hasattr(self, 'doc_header_combo'):
+            self.doc_header_combo['values'] = values
+            if values:
+                self.doc_header_var.set(values[0])
+
+    def _browse_doc_header(self):
+        """浏览选择关联头文件"""
+        file_path = filedialog.askopenfilename(
+            title="选择关联头文件",
+            filetypes=[
+                ("C 头文件", "*.h"),
+                ("C 源文件", "*.c"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if file_path:
+            self.doc_header_var.set(file_path)
+
+    def _get_doc_header_content(self) -> str:
+        """获取文档关联的头文件内容"""
+        header_path = self.doc_header_var.get() if hasattr(self, 'doc_header_var') else ""
+        if header_path and os.path.exists(header_path):
+            try:
+                with open(header_path, 'r', encoding='utf-8', errors='replace') as f:
+                    return f.read()
+            except Exception:
+                pass
+        return self._collect_header_content()
+
+    # ──────────────────────────────────────────────
+    # 映射文档工作流 - 阶段1: GUI映射→映射文档
+    # ──────────────────────────────────────────────
+
+    def _export_mapping_doc_from_gui(self):
+        """从当前 GUI 映射关系生成规范映射文档"""
+        if not self.mappings:
+            messagebox.showwarning("警告", "请先在 GUI 中配置映射关系！")
+            return
+
+        generator = MappingDocGenerator(self)
+        doc = generator.generate()
+        self.mapping_doc_content = doc
+
+        if hasattr(self, 'mapping_doc_text'):
+            self.mapping_doc_text.delete('1.0', tk.END)
+            self.mapping_doc_text.insert('1.0', doc)
+
+        self.status_var.set("✅ 已从 GUI 映射关系生成规范映射文档")
+
+    def _export_mapping_doc(self):
+        """导出规范映射文档到文件"""
+        self._export_mapping_doc_from_gui()
+        if not self.mapping_doc_content:
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="保存规范映射文档",
+            defaultextension=".md",
+            filetypes=[
+                ("Markdown 文件", "*.md"),
+                ("文本文件", "*.txt"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(self.mapping_doc_content)
+            messagebox.showinfo("成功", f"映射文档已保存到: {file_path}")
+            self.status_var.set(f"映射文档已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def _import_mapping_doc(self):
+        """从文件加载规范映射文档"""
+        file_path = filedialog.askopenfilename(
+            title="加载规范映射文档",
+            filetypes=[
+                ("Markdown 文件", "*.md"),
+                ("文本文件", "*.txt"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+
+            self.mapping_doc_content = content
+            if hasattr(self, 'mapping_doc_text'):
+                self.mapping_doc_text.delete('1.0', tk.END)
+                self.mapping_doc_text.insert('1.0', content)
+
+            self.status_var.set(f"已加载映射文档: {os.path.basename(file_path)}")
+        except Exception as e:
+            messagebox.showerror("错误", f"加载映射文档失败: {e}")
+
+    def _import_mapping_doc_to_gui(self):
+        """将映射文档中的映射关系导入到 GUI"""
+        if not hasattr(self, 'mapping_doc_text'):
+            return
+        content = self.mapping_doc_text.get('1.0', tk.END).strip()
+        if not content:
+            messagebox.showwarning("警告", "映射文档为空！")
+            return
+
+        generator = DocumentBasedGenerator(
+            parser=self.parser,
+            target_parser=self.target_parser
+        )
+        imported_vars, imported_mappings = generator.parse_mappings_from_document(content)
+
+        if not imported_mappings:
+            messagebox.showwarning(
+                "警告",
+                "未能从映射文档中解析出映射关系！\n"
+                "请确保文档格式正确。"
+            )
+            return
+
+        self._show_import_preview(imported_vars, imported_mappings, "映射文档")
+
+    # ──────────────────────────────────────────────
+    # 映射文档工作流 - 阶段2: 自然语言→映射文档 (LLM)
+    # ──────────────────────────────────────────────
+
+    def _llm_doc_to_mapping_doc(self):
+        """通过 LLM 将自然语言文档转换为规范映射文档"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "请先配置 LLM 服务！\n菜单: 🤖 AI 助手 → ⚙️ LLM 服务设置")
+            return
+
+        if not self.doc_content:
+            messagebox.showwarning("警告", "请先加载需求文档！")
+            return
+
+        header_content = self._get_doc_header_content()
+
+        self.status_var.set("正在通过 AI 将自然语言文档转换为映射文档...")
+        self.root.update_idletasks()
+
+        def call_llm():
+            success, result = self.llm_service.convert_doc_to_mapping_doc(
+                self.doc_content, header_content
+            )
+            self.root.after(0, lambda: self._on_mapping_doc_result(success, result))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+
+    def _on_mapping_doc_result(self, success: bool, result: str):
+        """映射文档生成结果回调"""
+        if not hasattr(self, 'mapping_doc_text'):
+            return
+
+        if success:
+            # 尝试提取文档内容（可能被代码块包裹）
+            doc = self._extract_mapping_doc_from_response(result)
+            self.mapping_doc_content = doc
+            self.mapping_doc_text.delete('1.0', tk.END)
+            self.mapping_doc_text.insert('1.0', doc)
+            self.status_var.set("✅ AI 映射文档生成完成，可编辑后用于生成代码")
+        else:
+            self.mapping_doc_text.delete('1.0', tk.END)
+            self.mapping_doc_text.insert('1.0', f"/* 生成失败 */\n{result}")
+            self.status_var.set("❌ AI 映射文档生成失败")
+
+    # ──────────────────────────────────────────────
+    # 映射文档工作流 - 阶段3: 映射文档→代码
+    # ──────────────────────────────────────────────
+
+    def _llm_mapping_doc_to_code(self):
+        """通过 LLM 基于规范映射文档生成代码"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "请先配置 LLM 服务！\n菜单: 🤖 AI 助手 → ⚙️ LLM 服务设置")
+            return
+
+        mapping_doc = self._get_current_mapping_doc()
+        if not mapping_doc:
+            return
+
+        header_content = self._get_doc_header_content()
+
+        self.status_var.set("正在通过 AI 基于映射文档生成代码...")
+        self.root.update_idletasks()
+
+        def call_llm():
+            success, result = self.llm_service.generate_code_from_mapping_doc(
+                mapping_doc, header_content
+            )
+            self.root.after(0, lambda: self._on_doc_code_result(success, result))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+
+    def _local_mapping_doc_to_code(self):
+        """本地基于映射文档生成代码"""
+        mapping_doc = self._get_current_mapping_doc()
+        if not mapping_doc:
+            return
+
+        header_content = self._get_doc_header_content()
+
+        generator = DocumentBasedGenerator(
+            parser=self.parser,
+            target_parser=self.target_parser
+        )
+        code = generator.generate_code(
+            mapping_doc,
+            header_content,
+            source_structs=dict(self.parser.structs) if self.parser else {},
+            target_structs=dict(self.target_parser.structs) if self.target_parser else {},
+        )
+
+        if hasattr(self, 'doc_code_text'):
+            self.doc_code_text.delete('1.0', tk.END)
+            self.doc_code_text.insert('1.0', code)
+
+        self.status_var.set("✅ 本地映射文档代码生成完成")
+
+    def _get_current_mapping_doc(self) -> str:
+        """获取当前映射文档内容"""
+        if not hasattr(self, 'mapping_doc_text'):
+            return ""
+        content = self.mapping_doc_text.get('1.0', tk.END).strip()
+        if not content:
+            messagebox.showwarning("警告", "映射文档为空！请先生成或加载映射文档。")
+            return ""
+        return content
+
+    def _on_doc_code_result(self, success: bool, result: str):
+        """映射文档→代码 结果回调"""
+        if not hasattr(self, 'doc_code_text'):
+            return
+
+        self.doc_code_text.delete('1.0', tk.END)
+
+        if success:
+            code = self._extract_code_from_llm_response(result)
+            self.doc_code_text.insert('1.0', code)
+            self.status_var.set("✅ AI 映射文档代码生成完成")
+        else:
+            self.doc_code_text.insert('1.0', f"/* 生成失败 */\n/* {result} */")
+            self.status_var.set("❌ AI 映射文档代码生成失败")
+
+    def _copy_doc_code(self):
+        """复制文档生成代码"""
+        if not hasattr(self, 'doc_code_text'):
+            return
+        code = self.doc_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可复制的内容！")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(code)
+        self.status_var.set("文档生成代码已复制到剪贴板")
+
+    def _save_doc_code(self):
+        """保存文档生成代码"""
+        if not hasattr(self, 'doc_code_text'):
+            return
+        code = self.doc_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可保存的内容！")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="保存文档生成代码",
+            defaultextension=".c",
+            filetypes=[("C 源文件", "*.c"), ("头文件", "*.h"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
+            messagebox.showinfo("成功", f"代码已保存到: {file_path}")
+            self.status_var.set(f"文档生成代码已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def _copy_doc_to_code_tab(self):
+        """将文档生成代码复制到代码标签页"""
+        if not hasattr(self, 'doc_code_text'):
+            return
+        code = self.doc_code_text.get('1.0', tk.END).strip()
+        if not code:
+            messagebox.showwarning("警告", "没有可复制的内容！")
+            return
+        self.code_text.delete('1.0', tk.END)
+        self.code_text.insert('1.0', code)
+        self._apply_syntax_highlighting()
+        self.status_var.set("已将文档生成代码复制到代码标签页")
 
     def _open_file(self):
-        """打开头文件"""
         file_path = filedialog.askopenfilename(
             title="选择头文件",
             filetypes=[
@@ -447,8 +4487,9 @@ class ExternMapperApp:
             messagebox.showerror("错误", f"无法解析文件: {file_path}")
             return
 
-        # 更新 extern 变量列表
         self._refresh_extern_list()
+        self._update_struct_type_combo()
+        self._update_condition_var_combo()
 
         summary = self.parser.get_summary()
         self.parse_info_var.set(
@@ -459,8 +4500,57 @@ class ExternMapperApp:
         )
         self.status_var.set(f"已加载头文件: {file_path}")
 
+    def _open_target_file(self):
+        file_path = filedialog.askopenfilename(
+            title="选择目标头文件",
+            filetypes=[
+                ("C 头文件", "*.h"),
+                ("C 源文件", "*.c"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+
+        self.target_file.set(file_path)
+        success = self.target_parser.parse_file(file_path)
+
+        if not success:
+            messagebox.showerror("错误", f"无法解析目标文件: {file_path}")
+            return
+
+        self._refresh_target_var_list()
+        self._update_struct_type_combo()
+        self._update_condition_var_combo()
+
+        summary = self.target_parser.get_summary()
+        self.target_info_var.set(
+            f"✅ 目标: {os.path.basename(file_path)} | "
+            f"结构体: {summary['struct_count']} | "
+            f"Extern: {summary['extern_var_count']} | "
+            f"Typedef: {summary['typedef_count']}"
+        )
+        self.status_var.set(f"已加载目标头文件: {file_path}")
+
+    def _update_condition_var_combo(self):
+        """更新条件变量选择下拉框"""
+        if not hasattr(self, 'cond_var_ref'):
+            return
+        values = []
+        if self.selected_extern_var and self.selected_extern_var.get('is_struct'):
+            members = self.parser.get_nested_members(
+                self.selected_extern_var.get('struct_type', '')
+            )
+            values = [m.get('full_path', m['name']) for m in members]
+        self.cond_var_ref['values'] = values
+        if values:
+            self.cond_var_ref.set(values[0])
+        else:
+            self.cond_var_ref.set('')
+
     def _refresh_extern_list(self):
-        """刷新 extern 变量列表"""
+        if not hasattr(self, 'extern_tree'):
+            return
         self.extern_tree.delete(*self.extern_tree.get_children())
         self.extern_vars = self.parser.extern_vars
 
@@ -470,8 +4560,31 @@ class ExternMapperApp:
                 var['name'], var['type'], is_struct
             ))
 
+    def _refresh_target_var_list(self):
+        if not hasattr(self, 'target_var_tree'):
+            return
+        self.target_var_tree.delete(*self.target_var_tree.get_children())
+
+        for var in self.target_parser.extern_vars:
+            is_struct = "✓" if var['is_struct'] else "—"
+            struct_type = var.get('struct_type', '') if var['is_struct'] else "—"
+            self.target_var_tree.insert('', tk.END, values=(
+                var['name'], var['type'], is_struct, struct_type
+            ))
+
+    def _update_struct_type_combo(self):
+        if not hasattr(self, 'struct_type_combo'):
+            return
+        struct_names = list(self.parser.structs.keys())
+        target_struct_names = list(self.target_parser.structs.keys())
+        all_structs = sorted(set(struct_names + target_struct_names))
+        self.struct_type_combo['values'] = all_structs
+        if all_structs:
+            self.struct_type_combo.set(all_structs[0])
+        else:
+            self.struct_type_combo.set('')
+
     def _import_config(self):
-        """导入映射配置"""
         file_path = filedialog.askopenfilename(
             title="导入映射配置",
             filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
@@ -483,20 +4596,27 @@ class ExternMapperApp:
             with open(file_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
 
-            # 恢复用户变量
             self.user_vars = config.get('user_vars', [])
             self._refresh_user_var_list()
 
-            # 恢复映射
             self.mappings = config.get('mappings', [])
             self._refresh_mapping_list()
 
-            # 如果有关联的头文件，尝试加载
             header_file = config.get('header_file', '')
             if header_file and os.path.exists(header_file):
                 self.current_file.set(header_file)
                 self.parser.parse_file(header_file)
                 self._refresh_extern_list()
+                self._update_struct_type_combo()
+                self._update_condition_var_combo()
+
+            target_header = config.get('target_header_file', '')
+            if target_header and os.path.exists(target_header):
+                self.target_file.set(target_header)
+                self.target_parser.parse_file(target_header)
+                self._refresh_target_var_list()
+                self._update_struct_type_combo()
+                self._update_condition_var_combo()
 
             messagebox.showinfo("成功", "配置导入成功！")
             self.status_var.set(f"已导入配置: {os.path.basename(file_path)}")
@@ -505,7 +4625,6 @@ class ExternMapperApp:
             messagebox.showerror("错误", f"导入配置失败: {e}")
 
     def _export_config(self):
-        """导出映射配置"""
         file_path = filedialog.asksaveasfilename(
             title="导出映射配置",
             defaultextension=".json",
@@ -516,6 +4635,7 @@ class ExternMapperApp:
 
         config = {
             'header_file': self.current_file.get(),
+            'target_header_file': self.target_file.get(),
             'user_vars': self.user_vars,
             'mappings': self.mappings,
         }
@@ -528,10 +4648,7 @@ class ExternMapperApp:
         except Exception as e:
             messagebox.showerror("错误", f"导出配置失败: {e}")
 
-    # ── Extern 变量选择 ───────────────────────────────────────────
-
     def _on_extern_select(self, event):
-        """当选择 extern 变量时"""
         selection = self.extern_tree.selection()
         if not selection:
             return
@@ -539,16 +4656,13 @@ class ExternMapperApp:
         item = self.extern_tree.item(selection[0])
         var_name = item['values'][0]
 
-        # 查找变量信息
         self.selected_extern_var = self.parser.get_extern_var(var_name)
         if not self.selected_extern_var:
             return
 
-        # 更新成员列表
         self._refresh_member_list()
-
-        # 更新映射面板中的 extern 成员下拉框
         self._update_extern_member_combo()
+        self._update_condition_var_combo()
 
         self.member_title_var.set(
             f"变量: {var_name} ({self.selected_extern_var['type']})"
@@ -556,14 +4670,12 @@ class ExternMapperApp:
         self.status_var.set(f"已选择 extern 变量: {var_name}")
 
     def _refresh_member_list(self):
-        """刷新成员列表"""
         self.member_tree.delete(*self.member_tree.get_children())
 
         if not self.selected_extern_var:
             return
 
         if self.selected_extern_var['is_struct']:
-            # 展示结构体成员（包括嵌套展开）
             members = self.parser.get_nested_members(
                 self.selected_extern_var['struct_type']
             )
@@ -579,7 +4691,6 @@ class ExternMapperApp:
                     bitfield
                 ), tags=(m.get('full_path', m['name']),))
         else:
-            # 基本类型变量，没有成员
             self.member_tree.insert('', tk.END, values=(
                 self.selected_extern_var['name'],
                 self.selected_extern_var['type'],
@@ -587,7 +4698,8 @@ class ExternMapperApp:
             ))
 
     def _update_extern_member_combo(self):
-        """更新映射面板中的 extern 成员下拉框"""
+        if not hasattr(self, 'map_extern_member'):
+            return
         values = []
 
         if self.selected_extern_var:
@@ -606,7 +4718,6 @@ class ExternMapperApp:
             self.map_extern_member.set('')
 
     def _on_member_select(self, event):
-        """当选择成员时，自动设置到映射面板"""
         selection = self.member_tree.selection()
         if not selection:
             return
@@ -615,10 +4726,22 @@ class ExternMapperApp:
         member_name = item['values'][0]
         self.map_extern_member.set(member_name)
 
-    # ── 用户变量管理 ──────────────────────────────────────────────
+    def _on_user_var_type_changed(self, event=None):
+        if self.user_var_type.get() == '自定义':
+            self.user_var_custom_type.config(state='normal')
+            self.struct_type_combo.config(state='readonly')
+        else:
+            self.user_var_custom_type.config(state='normal')
+            self.struct_type_combo.config(state='readonly')
+
+    def _on_struct_type_selected(self, event=None):
+        selected = self.struct_type_combo.get()
+        if selected:
+            self.user_var_type.set('自定义')
+            self.user_var_custom_type.delete(0, tk.END)
+            self.user_var_custom_type.insert(0, selected)
 
     def _add_user_var(self):
-        """添加用户自定义变量"""
         name = self.user_var_name.get().strip()
         type_sel = self.user_var_type.get()
         custom_type = self.user_var_custom_type.get().strip()
@@ -628,32 +4751,202 @@ class ExternMapperApp:
             messagebox.showwarning("警告", "请输入变量名！")
             return
 
-        # 确定类型
         var_type = custom_type if type_sel == '自定义' and custom_type else type_sel
 
-        # 检查重复
         for v in self.user_vars:
             if v['name'] == name:
                 messagebox.showwarning("警告", f"变量 '{name}' 已存在！")
                 return
 
+        is_struct = self._is_struct_type(var_type)
+
         self.user_vars.append({
             'name': name,
             'type': var_type,
             'desc': desc,
+            'source': '手动',
+            'is_struct': is_struct,
         })
+
+        if is_struct:
+            self._expand_struct_user_var(name, var_type)
 
         self._refresh_user_var_list()
         self._update_user_var_combo()
 
-        # 清空输入
         self.user_var_name.delete(0, tk.END)
+        self.user_var_custom_type.delete(0, tk.END)
         self.user_var_desc.delete(0, tk.END)
 
         self.status_var.set(f"已添加用户变量: {name} ({var_type})")
 
+    def _is_struct_type(self, type_str: str) -> bool:
+        clean = type_str.replace('*', '').strip()
+        if clean.startswith('struct '):
+            return True
+        if clean in self.parser.structs:
+            return True
+        if clean in self.target_parser.structs:
+            return True
+        return False
+
+    def _get_parser_for_struct(self, struct_type: str) -> Optional[HeaderParser]:
+        clean = struct_type.replace('*', '').strip()
+        if clean.startswith('struct '):
+            clean = clean[7:].strip()
+        if clean in self.parser.structs:
+            return self.parser
+        if clean in self.target_parser.structs:
+            return self.target_parser
+        return None
+
+    def _expand_struct_user_var(self, var_name: str, var_type: str):
+        parser = self._get_parser_for_struct(var_type)
+        if not parser:
+            return
+
+        clean_type = var_type.replace('*', '').strip()
+        if clean_type.startswith('struct '):
+            clean_type = clean_type[7:].strip()
+
+        members = parser.get_nested_members(clean_type)
+        for m in members:
+            member_name = f"{var_name}.{m.get('full_path', m['name'])}"
+            if not any(v['name'] == member_name for v in self.user_vars):
+                self.user_vars.append({
+                    'name': member_name,
+                    'type': m['type'],
+                    'desc': f"{var_name} 的成员 {m.get('full_path', m['name'])}",
+                    'source': f'结构体展开',
+                    'is_struct': False,
+                })
+
+    def _add_from_struct(self):
+        all_structs = sorted(set(
+            list(self.parser.structs.keys()) + list(self.target_parser.structs.keys())
+        ))
+        if not all_structs:
+            messagebox.showwarning("警告", "没有可用的结构体类型！请先加载头文件。")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("从结构体添加用户变量")
+        dialog.geometry("600x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        top_frame = ttk.Frame(dialog, padding=5)
+        top_frame.pack(fill=tk.X)
+
+        ttk.Label(top_frame, text="选择结构体类型:", style='Header.TLabel').pack(side=tk.LEFT)
+        struct_combo = ttk.Combobox(top_frame, values=all_structs, state='readonly', width=25)
+        struct_combo.pack(side=tk.LEFT, padx=5)
+        if all_structs:
+            struct_combo.set(all_structs[0])
+
+        name_frame = ttk.Frame(dialog, padding=5)
+        name_frame.pack(fill=tk.X)
+        ttk.Label(name_frame, text="变量名前缀:").pack(side=tk.LEFT)
+        prefix_entry = ttk.Entry(name_frame, width=20)
+        prefix_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(name_frame, text="(留空则使用结构体名)", style='Info.TLabel').pack(side=tk.LEFT)
+
+        expand_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(name_frame, text="展开结构体成员", variable=expand_var).pack(side=tk.LEFT, padx=10)
+
+        member_frame = ttk.LabelFrame(dialog, text="结构体成员预览", padding=5)
+        member_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        preview_columns = ('name', 'type', 'array', 'pointer')
+        preview_tree = ttk.Treeview(
+            member_frame, columns=preview_columns, show='headings',
+            selectmode='extended', height=12
+        )
+        preview_tree.heading('name', text='成员名')
+        preview_tree.heading('type', text='类型')
+        preview_tree.heading('array', text='数组')
+        preview_tree.heading('pointer', text='指针')
+        preview_tree.column('name', width=150, minwidth=80)
+        preview_tree.column('type', width=120, minwidth=80)
+        preview_tree.column('array', width=60, minwidth=40, anchor=tk.CENTER)
+        preview_tree.column('pointer', width=60, minwidth=40, anchor=tk.CENTER)
+
+        preview_scroll = ttk.Scrollbar(member_frame, orient=tk.VERTICAL, command=preview_tree.yview)
+        preview_tree.configure(yscrollcommand=preview_scroll.set)
+        preview_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        preview_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def on_struct_changed(event=None):
+            preview_tree.delete(*preview_tree.get_children())
+            sel = struct_combo.get()
+            if not sel:
+                return
+            p = self._get_parser_for_struct(sel)
+            if not p:
+                return
+            members = p.get_nested_members(sel)
+            for m in members:
+                array_info = str(m.get('array_size', '')) if m.get('is_array') else "—"
+                pointer = "✓" if m.get('is_pointer') else "—"
+                preview_tree.insert('', tk.END, values=(
+                    m.get('full_path', m['name']),
+                    m['type'],
+                    array_info,
+                    pointer
+                ))
+
+        struct_combo.bind('<<ComboboxSelected>>', on_struct_changed)
+        if all_structs:
+            on_struct_changed()
+
+        def do_add():
+            sel = struct_combo.get()
+            if not sel:
+                messagebox.showwarning("警告", "请选择结构体类型！")
+                return
+
+            prefix = prefix_entry.get().strip() or sel
+            do_expand = expand_var.get()
+            p = self._get_parser_for_struct(sel)
+            if not p:
+                return
+
+            count = 0
+
+            self.user_vars.append({
+                'name': prefix,
+                'type': sel,
+                'desc': f'结构体变量 ({sel})',
+                'source': '结构体添加',
+                'is_struct': True,
+            })
+            count += 1
+
+            if do_expand:
+                members = p.get_nested_members(sel)
+                for m in members:
+                    member_name = f"{prefix}.{m.get('full_path', m['name'])}"
+                    if not any(v['name'] == member_name for v in self.user_vars):
+                        self.user_vars.append({
+                            'name': member_name,
+                            'type': m['type'],
+                            'desc': f"{prefix} 的成员 {m.get('full_path', m['name'])}",
+                            'source': '结构体展开',
+                            'is_struct': False,
+                        })
+                        count += 1
+
+            self._refresh_user_var_list()
+            self._update_user_var_combo()
+            self.status_var.set(f"从结构体 {sel} 添加了 {count} 个变量")
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog, padding=5)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="➕ 添加", command=do_add, style='Accent.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
     def _del_user_var(self):
-        """删除选中的用户变量"""
         selection = self.user_var_tree.selection()
         if not selection:
             messagebox.showwarning("警告", "请先选择要删除的变量！")
@@ -662,13 +4955,16 @@ class ExternMapperApp:
         item = self.user_var_tree.item(selection[0])
         var_name = item['values'][0]
 
-        self.user_vars = [v for v in self.user_vars if v['name'] != var_name]
+        to_remove = [var_name]
+        if any(v['name'] == var_name and v.get('is_struct') for v in self.user_vars):
+            to_remove = [v['name'] for v in self.user_vars if v['name'] == var_name or v['name'].startswith(f"{var_name}.")]
+
+        self.user_vars = [v for v in self.user_vars if v['name'] not in to_remove]
         self._refresh_user_var_list()
         self._update_user_var_combo()
-        self.status_var.set(f"已删除用户变量: {var_name}")
+        self.status_var.set(f"已删除用户变量: {var_name} (及 {len(to_remove) - 1} 个子成员)")
 
     def _batch_add_user_var(self):
-        """批量添加用户变量"""
         dialog = tk.Toplevel(self.root)
         dialog.title("批量添加用户变量")
         dialog.geometry("450x350")
@@ -693,12 +4989,15 @@ class ExternMapperApp:
                 if len(parts) >= 2:
                     name, var_type = parts[0], parts[1]
                     desc = parts[2] if len(parts) > 2 else ""
-                    # 检查重复
                     if not any(v['name'] == name for v in self.user_vars):
+                        is_struct = self._is_struct_type(var_type)
                         self.user_vars.append({
-                            'name': name, 'type': var_type, 'desc': desc
+                            'name': name, 'type': var_type, 'desc': desc,
+                            'source': '批量添加', 'is_struct': is_struct,
                         })
                         count += 1
+                        if is_struct:
+                            self._expand_struct_user_var(name, var_type)
 
             self._refresh_user_var_list()
             self._update_user_var_combo()
@@ -708,15 +5007,18 @@ class ExternMapperApp:
         ttk.Button(dialog, text="添加", command=do_add, style='Accent.TButton').pack(pady=10)
 
     def _refresh_user_var_list(self):
-        """刷新用户变量列表"""
+        if not hasattr(self, 'user_var_tree'):
+            return
         self.user_var_tree.delete(*self.user_var_tree.get_children())
         for v in self.user_vars:
+            source = v.get('source', '手动')
             self.user_var_tree.insert('', tk.END, values=(
-                v['name'], v['type'], v.get('desc', '')
+                v['name'], v['type'], v.get('desc', ''), source
             ))
 
     def _update_user_var_combo(self):
-        """更新映射面板中的用户变量下拉框"""
+        if not hasattr(self, 'map_user_var'):
+            return
         values = [v['name'] for v in self.user_vars]
         self.map_user_var['values'] = values
         if values:
@@ -724,18 +5026,155 @@ class ExternMapperApp:
         else:
             self.map_user_var.set('')
 
-    # ── 映射管理 ──────────────────────────────────────────────────
+    def _on_target_var_select(self, event):
+        selection = self.target_var_tree.selection()
+        if not selection:
+            return
+
+        self.target_member_tree.delete(*self.target_member_tree.get_children())
+
+        for sel_item in selection:
+            item = self.target_var_tree.item(sel_item)
+            var_name = item['values'][0]
+            var_info = self.target_parser.get_extern_var(var_name)
+            if not var_info:
+                continue
+
+            if var_info['is_struct']:
+                members = self.target_parser.get_nested_members(
+                    var_info.get('struct_type', '')
+                )
+                for m in members:
+                    array_info = str(m.get('array_size', '')) if m.get('is_array') else "—"
+                    pointer = "✓" if m.get('is_pointer') else "—"
+                    self.target_member_tree.insert('', tk.END, values=(
+                        f"{var_name}.{m.get('full_path', m['name'])}",
+                        m['type'],
+                        array_info,
+                        pointer
+                    ))
+            else:
+                self.target_member_tree.insert('', tk.END, values=(
+                    var_name,
+                    var_info['type'],
+                    "—",
+                    "✓" if var_info.get('is_pointer') else "—"
+                ))
+
+    def _import_target_vars(self):
+        selection = self.target_var_tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "请先选择要导入的目标变量！")
+            return
+
+        count = 0
+        for sel_item in selection:
+            item = self.target_var_tree.item(sel_item)
+            var_name = item['values'][0]
+            var_info = self.target_parser.get_extern_var(var_name)
+            if not var_info:
+                continue
+
+            if not any(v['name'] == var_name for v in self.user_vars):
+                is_struct = var_info.get('is_struct', False)
+                self.user_vars.append({
+                    'name': var_name,
+                    'type': var_info['type'],
+                    'desc': f'来自目标头文件',
+                    'source': '目标头文件',
+                    'is_struct': is_struct,
+                })
+                count += 1
+
+                if is_struct:
+                    self._expand_struct_user_var_from_target(var_name, var_info)
+
+        self._refresh_user_var_list()
+        self._update_user_var_combo()
+        self.status_var.set(f"从目标头文件导入了 {count} 个变量")
+
+    def _import_all_target_vars(self):
+        if not self.target_parser.extern_vars:
+            messagebox.showwarning("警告", "目标头文件中没有变量！")
+            return
+
+        count = 0
+        for var_info in self.target_parser.extern_vars:
+            var_name = var_info['name']
+            if not any(v['name'] == var_name for v in self.user_vars):
+                is_struct = var_info.get('is_struct', False)
+                self.user_vars.append({
+                    'name': var_name,
+                    'type': var_info['type'],
+                    'desc': '来自目标头文件',
+                    'source': '目标头文件',
+                    'is_struct': is_struct,
+                })
+                count += 1
+
+                if is_struct:
+                    self._expand_struct_user_var_from_target(var_name, var_info)
+
+        self._refresh_user_var_list()
+        self._update_user_var_combo()
+        self.status_var.set(f"从目标头文件导入了全部 {count} 个变量")
+
+    def _import_target_struct_members(self):
+        selection = self.target_var_tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "请先选择一个结构体类型的目标变量！")
+            return
+
+        count = 0
+        for sel_item in selection:
+            item = self.target_var_tree.item(sel_item)
+            var_name = item['values'][0]
+            var_info = self.target_parser.get_extern_var(var_name)
+            if not var_info or not var_info.get('is_struct'):
+                continue
+
+            struct_type = var_info.get('struct_type', '')
+            members = self.target_parser.get_nested_members(struct_type)
+            for m in members:
+                member_name = f"{var_name}.{m.get('full_path', m['name'])}"
+                if not any(v['name'] == member_name for v in self.user_vars):
+                    self.user_vars.append({
+                        'name': member_name,
+                        'type': m['type'],
+                        'desc': f'{var_name} 的成员 {m.get("full_path", m["name"])}',
+                        'source': '目标结构体展开',
+                        'is_struct': False,
+                    })
+                    count += 1
+
+        self._refresh_user_var_list()
+        self._update_user_var_combo()
+        self.status_var.set(f"从目标结构体导入了 {count} 个成员变量")
+
+    def _expand_struct_user_var_from_target(self, var_name: str, var_info: Dict):
+        if not var_info.get('is_struct'):
+            return
+
+        struct_type = var_info.get('struct_type', '')
+        members = self.target_parser.get_nested_members(struct_type)
+        for m in members:
+            member_name = f"{var_name}.{m.get('full_path', m['name'])}"
+            if not any(v['name'] == member_name for v in self.user_vars):
+                self.user_vars.append({
+                    'name': member_name,
+                    'type': m['type'],
+                    'desc': f'{var_name} 的成员 {m.get("full_path", m["name"])}',
+                    'source': '目标结构体展开',
+                    'is_struct': False,
+                })
 
     def _on_op_type_changed(self, event=None):
-        """操作类型改变时的回调"""
         pass
 
     def _add_mapping(self):
-        """添加映射关系"""
         ext_member = self.map_extern_member.get()
         user_var = self.map_user_var.get()
         op_type = self.map_op_type.get()
-        condition = self.map_condition.get().strip()
         conversion = self.map_conversion.get()
         custom_conv = self.map_custom_conv.get().strip()
 
@@ -746,7 +5185,6 @@ class ExternMapperApp:
             messagebox.showwarning("警告", "请选择用户变量！")
             return
 
-        # 确定转换规则
         conv_rule = '='
         if conversion == '强制转换':
             conv_rule = f'({self._get_user_var_type(user_var)})'
@@ -761,22 +5199,64 @@ class ExternMapperApp:
             'extern_member': ext_member,
             'user_var': user_var,
             'op_type': op_type,
-            'condition': condition,
+            'condition': self.current_conditions.copy(),
             'conversion': conversion,
             'conv_rule': conv_rule,
         }
 
         self.mappings.append(mapping)
         self._refresh_mapping_list()
+        self._clear_conditions()
 
-        # 清空条件输入
-        self.map_condition.delete(0, tk.END)
         self.map_custom_conv.delete(0, tk.END)
 
         self.status_var.set(f"已添加映射: {ext_member} → {user_var} ({op_type})")
 
+    def _auto_match(self):
+        if not self.selected_extern_var or not self.selected_extern_var.get('is_struct'):
+            messagebox.showwarning("警告", "请先选择一个结构体类型的 Extern 变量！")
+            return
+
+        if not self.user_vars:
+            messagebox.showwarning("警告", "请先添加用户变量！")
+            return
+
+        ext_members = self.parser.get_nested_members(
+            self.selected_extern_var['struct_type']
+        )
+
+        count = 0
+        for ext_m in ext_members:
+            ext_name = ext_m.get('full_path', ext_m['name'])
+            ext_type = ext_m['type'].replace('*', '').strip()
+
+            for uv in self.user_vars:
+                if uv.get('is_struct'):
+                    continue
+
+                uv_base = uv['name'].split('.')[-1] if '.' in uv['name'] else uv['name']
+                ext_base = ext_name.split('.')[-1] if '.' in ext_name else ext_name
+
+                if uv_base.lower() == ext_base.lower():
+                    already = any(
+                        m['extern_member'] == ext_name and m['user_var'] == uv['name']
+                        for m in self.mappings
+                    )
+                    if not already:
+                        self.mappings.append({
+                            'extern_member': ext_name,
+                            'user_var': uv['name'],
+                            'op_type': '直接赋值',
+                            'condition': [],
+                            'conversion': '=',
+                            'conv_rule': '=',
+                        })
+                        count += 1
+
+        self._refresh_mapping_list()
+        self.status_var.set(f"自动匹配了 {count} 个映射关系")
+
     def _del_mapping(self):
-        """删除选中的映射"""
         selection = self.mapping_tree.selection()
         if not selection:
             messagebox.showwarning("警告", "请先选择要删除的映射！")
@@ -789,7 +5269,6 @@ class ExternMapperApp:
             self.status_var.set(f"已删除映射: {removed['extern_member']} → {removed['user_var']}")
 
     def _move_mapping(self, direction: int):
-        """移动映射顺序"""
         selection = self.mapping_tree.selection()
         if not selection:
             return
@@ -799,13 +5278,11 @@ class ExternMapperApp:
         if 0 <= new_idx < len(self.mappings):
             self.mappings[idx], self.mappings[new_idx] = self.mappings[new_idx], self.mappings[idx]
             self._refresh_mapping_list()
-            # 重新选中
             children = self.mapping_tree.get_children()
             if new_idx < len(children):
                 self.mapping_tree.selection_set(children[new_idx])
 
     def _on_mapping_select(self, event):
-        """当选择映射时"""
         selection = self.mapping_tree.selection()
         if not selection:
             return
@@ -816,49 +5293,136 @@ class ExternMapperApp:
             self.map_extern_member.set(m['extern_member'])
             self.map_user_var.set(m['user_var'])
             self.map_op_type.set(m['op_type'])
-            self.map_condition.delete(0, tk.END)
-            self.map_condition.insert(0, m.get('condition', ''))
             self.map_conversion.set(m.get('conversion', '='))
             self.map_custom_conv.delete(0, tk.END)
             self.map_custom_conv.insert(0, m.get('conv_rule', '='))
 
+            self.current_conditions = m.get('condition', []).copy()
+            self._update_condition_preview()
+
     def _refresh_mapping_list(self):
-        """刷新映射列表"""
+        if not hasattr(self, 'mapping_tree'):
+            return
         self.mapping_tree.delete(*self.mapping_tree.get_children())
         for m in self.mappings:
+            conditions = m.get('condition', [])
+            cond_count = len(conditions) if isinstance(conditions, list) else 0
             self.mapping_tree.insert('', tk.END, values=(
                 m['extern_member'],
                 m['op_type'],
                 m['user_var'],
                 m.get('conversion', '='),
-                m.get('condition', '')
+                cond_count
             ))
 
     def _clear_mappings(self):
-        """清空所有映射"""
         if self.mappings and messagebox.askyesno("确认", "确定要清空所有映射关系吗？"):
             self.mappings.clear()
             self._refresh_mapping_list()
             self.code_text.delete('1.0', tk.END)
+            self.md_text.delete('1.0', tk.END)
             self.status_var.set("已清空所有映射")
 
-    # ── 代码生成 ──────────────────────────────────────────────────
-
     def _get_user_var_type(self, var_name: str) -> str:
-        """获取用户变量的类型"""
         for v in self.user_vars:
             if v['name'] == var_name:
                 return v['type']
         return 'int'
 
-    def _get_extern_var_name(self) -> str:
-        """获取当前选中的 extern 变量名"""
+    def _get_user_var_info(self, var_name: str) -> Optional[Dict]:
+        for v in self.user_vars:
+            if v['name'] == var_name:
+                return v
+        return None
+
+    def _is_target_var(self, var_name: str) -> bool:
+        info = self._get_user_var_info(var_name)
+        if info:
+            return info.get('source', '') in ('目标头文件', '目标结构体展开')
+        return False
+
+    def _get_var_lhs(self, var_name: str) -> str:
+        is_target = self._is_target_var(var_name)
+        if is_target:
+            if '.' in var_name:
+                base, member = var_name.split('.', 1)
+                return f"{base}->{member}"
+            return var_name
+        else:
+            if '.' in var_name:
+                base, member = var_name.split('.', 1)
+                return f"(*{base}).{member}"
+            return f"(*{var_name})"
+
+    def _get_var_base(self, var_name: str) -> str:
+        if '.' in var_name:
+            return var_name.split('.', 1)[0]
+        return var_name
+
+    def _get_member_tail(self, var_name: str) -> str:
+        if '.' in var_name:
+            parts = var_name.split('.', 1)
+            return parts[1]
+        return ""
+
+    def _collect_func_params(self, ext_var_name: str) -> list:
+        params = []
         if self.selected_extern_var:
-            return self.selected_extern_var['name']
-        return "ext_var"
+            params.append(f"{self.selected_extern_var['type']} *{ext_var_name}")
+        for uv in self.user_vars:
+            if any(m['user_var'] == uv['name'] for m in self.mappings):
+                if self._is_target_var(uv['name']):
+                    continue
+                base = self._get_var_base(uv['name'])
+                if not any(p.endswith(f"*{base}") for p in params):
+                    params.append(f"{uv['type']} *{base}")
+        return params
+
+    def _collect_target_externs(self) -> list:
+        result = []
+        seen = set()
+        for m in self.mappings:
+            if self._is_target_var(m['user_var']):
+                base = self._get_var_base(m['user_var'])
+                if base not in seen:
+                    seen.add(base)
+                    tinfo = self._get_user_var_info(base)
+                    if tinfo:
+                        result.append((base, tinfo['type']))
+        return result
+
+    def _build_condition_expression(self, conditions: List[Dict], ext_var: str) -> str:
+        """构建条件表达式字符串"""
+        if not conditions or not isinstance(conditions, list):
+            return ""
+
+        parts = []
+        for i, cond in enumerate(conditions):
+            var_ref = cond.get('var_ref', '')
+            operator = cond.get('operator', '==')
+            value = cond.get('value', '')
+
+            if not var_ref or not value:
+                continue
+
+            var_full = f"{ext_var}->{var_ref}"
+            expr = f"{var_full} {operator} {value}"
+            parts.append(expr)
+
+        if not parts:
+            return ""
+
+        if len(parts) == 1:
+            return parts[0]
+
+        result = f"({parts[0]})"
+        for i in range(1, len(parts)):
+            logic = conditions[i].get('logic', 'AND')
+            result += f" {logic} ({parts[i]})"
+
+        return result
 
     def _generate_code(self):
-        """生成代码"""
         if not self.mappings:
             messagebox.showwarning("警告", "请先添加映射关系！")
             return
@@ -886,28 +5450,22 @@ class ExternMapperApp:
         self.status_var.set(f"已生成代码 (模板: {template})")
 
     def _gen_assignment_function(self, ext_var_name: str) -> str:
-        """生成赋值函数"""
         lines = []
         lines.append(f"/*")
         lines.append(f" * 自动生成的赋值函数")
         lines.append(f" * Extern 变量: {ext_var_name}")
-        lines.append(f" * 生成时间: {self._get_timestamp()}")
+        lines.append(f" * 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f" */")
 
-        # 生成函数签名
-        params = [f"{ext_var_name}"]  # extern 变量作为参数
-        # 添加用户变量参数
-        for uv in self.user_vars:
-            if any(m['user_var'] == uv['name'] for m in self.mappings):
-                params.append(f"{uv['type']} *{uv['name']}")
+        target_externs = self._collect_target_externs()
+        if target_externs:
+            lines.append(f"/* 目标头文件 extern 变量引用 */")
+            for tvar, ttype in target_externs:
+                lines.append(f"extern {ttype} {tvar};")
+            lines.append("")
 
+        params = self._collect_func_params(ext_var_name)
         param_str = ", ".join(params)
-        if self.selected_extern_var:
-            param_str = f"{self.selected_extern_var['type']} *{ext_var_name}, " + ", ".join(
-                f"{uv['type']} *{uv['name']}" for uv in self.user_vars
-                if any(m['user_var'] == uv['name'] for m in self.mappings)
-            )
-
         lines.append(f"void assign_from_{ext_var_name}({param_str}) {{")
         lines.append(f"    if ({ext_var_name} == NULL) return;")
         lines.append("")
@@ -916,28 +5474,39 @@ class ExternMapperApp:
             ext_member = m['extern_member']
             user_var = m['user_var']
             op_type = m['op_type']
-            condition = m.get('condition', '')
+            condition = m.get('condition', [])
             conv_rule = m.get('conv_rule', '=')
 
+            lhs = self._get_var_lhs(user_var)
+            condition_expr = self._build_condition_expression(condition, ext_var_name)
+
             if op_type == '直接赋值':
-                if conv_rule == '=':
-                    lines.append(f"    (*{user_var}) = {ext_var_name}->{ext_member};")
+                if condition_expr:
+                    lines.append(f"    if ({condition_expr}) {{")
+                    if conv_rule == '=':
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                    lines.append(f"    }}")
                 else:
-                    lines.append(f"    (*{user_var}) = {ext_var_name}->{ext_member} {conv_rule};")
+                    if conv_rule == '=':
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
             elif op_type == '条件赋值':
-                cond = condition if condition else f"{ext_var_name}->{ext_member} != 0"
+                cond = condition_expr if condition_expr else f"{ext_var_name}->{ext_member} != 0"
                 if conv_rule == '=':
                     lines.append(f"    if ({cond}) {{")
-                    lines.append(f"        (*{user_var}) = {ext_var_name}->{ext_member};")
+                    lines.append(f"        {lhs} = {ext_var_name}->{ext_member};")
                     lines.append(f"    }}")
                 else:
                     lines.append(f"    if ({cond}) {{")
-                    lines.append(f"        (*{user_var}) = {ext_var_name}->{ext_member} {conv_rule};")
+                    lines.append(f"        {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
                     lines.append(f"    }}")
             elif op_type == '逻辑判断':
                 lines.append(f"    /* 逻辑判断: {ext_member} vs {user_var} */")
-                if condition:
-                    lines.append(f"    if ({condition}) {{")
+                if condition_expr:
+                    lines.append(f"    if ({condition_expr}) {{")
                     lines.append(f"        /* TODO: 处理判断逻辑 */")
                     lines.append(f"    }}")
                 else:
@@ -945,14 +5514,13 @@ class ExternMapperApp:
                     lines.append(f"        /* TODO: {user_var} 为真时的处理 */")
                     lines.append(f"    }}")
             elif op_type == '自定义表达式':
-                expr = condition if condition else f"(*{user_var}) = {ext_var_name}->{ext_member}"
-                lines.append(f"    {expr};")
+                expr = condition_expr if condition_expr else f"{lhs} = {ext_var_name}->{ext_member}"
+                lines.append(f"    {lhs} = {expr};")
 
         lines.append("}")
         return "\n".join(lines)
 
     def _gen_condition_function(self, ext_var_name: str) -> str:
-        """生成条件判断函数"""
         lines = []
         lines.append(f"/*")
         lines.append(f" * 自动生成的条件判断函数")
@@ -966,11 +5534,12 @@ class ExternMapperApp:
 
         for m in self.mappings:
             ext_member = m['extern_member']
-            condition = m.get('condition', '')
+            condition = m.get('condition', [])
 
-            if condition:
+            condition_expr = self._build_condition_expression(condition, ext_var_name)
+            if condition_expr:
                 lines.append(f"    /* 检查: {ext_member} */")
-                lines.append(f"    if (!({condition})) {{")
+                lines.append(f"    if (!({condition_expr})) {{")
                 lines.append(f"        result = 0;")
                 lines.append(f"    }}")
             else:
@@ -983,41 +5552,38 @@ class ExternMapperApp:
         return "\n".join(lines)
 
     def _gen_full_function(self, ext_var_name: str) -> str:
-        """生成完整转换函数（包含赋值和判断）"""
         lines = []
         lines.append(f"/*")
         lines.append(f" * 自动生成的完整转换函数")
         lines.append(f" * Extern 变量: {ext_var_name}")
-        lines.append(f" * 生成时间: {self._get_timestamp()}")
+        lines.append(f" * 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f" */")
 
-        # 函数签名
-        params = []
-        if self.selected_extern_var:
-            params.append(f"{self.selected_extern_var['type']} *{ext_var_name}")
-        for uv in self.user_vars:
-            if any(m['user_var'] == uv['name'] for m in self.mappings):
-                params.append(f"{uv['type']} *{uv['name']}")
+        target_externs = self._collect_target_externs()
+        if target_externs:
+            lines.append(f"/* 目标头文件 extern 变量引用 */")
+            for tvar, ttype in target_externs:
+                lines.append(f"extern {ttype} {tvar};")
+            lines.append("")
 
+        params = self._collect_func_params(ext_var_name)
         param_str = ", ".join(params)
         lines.append(f"int convert_{ext_var_name}({param_str}) {{")
         lines.append(f"    if ({ext_var_name} == NULL) return -1;")
         lines.append("")
 
-        # 条件判断部分
-        cond_mappings = [m for m in self.mappings if m['op_type'] in ('逻辑判断', '条件赋值')]
+        cond_mappings = [m for m in self.mappings if m['op_type'] in ('逻辑判断', '条件赋值') and m.get('condition')]
         if cond_mappings:
             lines.append(f"    /* ── 条件检查 ── */")
             for m in cond_mappings:
                 ext_member = m['extern_member']
-                condition = m.get('condition', '')
-                if condition:
-                    lines.append(f"    if (!({condition})) {{")
+                condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
+                if condition_expr:
+                    lines.append(f"    if (!({condition_expr})) {{")
                     lines.append(f"        return -1;  /* 条件不满足: {ext_member} */")
                     lines.append(f"    }}")
             lines.append("")
 
-        # 赋值部分
         assign_mappings = [m for m in self.mappings if m['op_type'] in ('直接赋值', '条件赋值', '自定义表达式')]
         if assign_mappings:
             lines.append(f"    /* ── 赋值操作 ── */")
@@ -1025,11 +5591,22 @@ class ExternMapperApp:
                 ext_member = m['extern_member']
                 user_var = m['user_var']
                 conv_rule = m.get('conv_rule', '=')
+                condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
 
-                if conv_rule == '=':
-                    lines.append(f"    (*{user_var}) = {ext_var_name}->{ext_member};")
+                lhs = self._get_var_lhs(user_var)
+
+                if condition_expr:
+                    lines.append(f"    if ({condition_expr}) {{")
+                    if conv_rule == '=':
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"        {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                    lines.append(f"    }}")
                 else:
-                    lines.append(f"    (*{user_var}) = {ext_var_name}->{ext_member} {conv_rule};")
+                    if conv_rule == '=':
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                    else:
+                        lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
             lines.append("")
 
         lines.append(f"    return 0;  /* 成功 */")
@@ -1037,7 +5614,6 @@ class ExternMapperApp:
         return "\n".join(lines)
 
     def _gen_assignment_statements(self, ext_var_name: str) -> str:
-        """生成仅赋值语句"""
         lines = []
         lines.append(f"/* 赋值语句 - Extern: {ext_var_name} */")
 
@@ -1045,25 +5621,35 @@ class ExternMapperApp:
             ext_member = m['extern_member']
             user_var = m['user_var']
             conv_rule = m.get('conv_rule', '=')
+            condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
 
-            if conv_rule == '=':
-                lines.append(f"(*{user_var}) = {ext_var_name}->{ext_member};")
+            lhs = self._get_var_lhs(user_var)
+
+            if condition_expr:
+                lines.append(f"if ({condition_expr}) {{")
+                if conv_rule == '=':
+                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member};")
+                else:
+                    lines.append(f"    {lhs} = {ext_var_name}->{ext_member} {conv_rule};")
+                lines.append(f"}}")
             else:
-                lines.append(f"(*{user_var}) = {ext_var_name}->{ext_member} {conv_rule};")
+                if conv_rule == '=':
+                    lines.append(f"{lhs} = {ext_var_name}->{ext_member};")
+                else:
+                    lines.append(f"{lhs} = {ext_var_name}->{ext_member} {conv_rule};")
 
         return "\n".join(lines)
 
     def _gen_condition_statements(self, ext_var_name: str) -> str:
-        """生成仅判断语句"""
         lines = []
         lines.append(f"/* 条件判断语句 - Extern: {ext_var_name} */")
 
         for m in self.mappings:
             ext_member = m['extern_member']
-            condition = m.get('condition', '')
+            condition_expr = self._build_condition_expression(m.get('condition', []), ext_var_name)
 
-            if condition:
-                lines.append(f"if ({condition}) {{")
+            if condition_expr:
+                lines.append(f"if ({condition_expr}) {{")
                 lines.append(f"    /* {ext_member} 条件满足 */")
                 lines.append(f"}}")
             else:
@@ -1074,14 +5660,11 @@ class ExternMapperApp:
         return "\n".join(lines)
 
     def _apply_syntax_highlighting(self):
-        """应用简单的语法高亮"""
         content = self.code_text.get('1.0', tk.END)
 
-        # 清除现有标签
         for tag in ('keyword', 'type', 'string', 'comment', 'number', 'function'):
             self.code_text.tag_remove(tag, '1.0', tk.END)
 
-        # 高亮关键字
         keywords = ['if', 'else', 'return', 'void', 'int', 'struct', 'typedef',
                      'NULL', 'const', 'static', 'unsigned', 'signed', 'for', 'while']
         for kw in keywords:
@@ -1094,7 +5677,6 @@ class ExternMapperApp:
                 self.code_text.tag_add('keyword', pos, end)
                 start = end
 
-        # 高亮注释
         start = '1.0'
         while True:
             pos = self.code_text.search('/*', start, tk.END)
@@ -1108,7 +5690,6 @@ class ExternMapperApp:
             self.code_text.tag_add('comment', pos, end_pos)
             start = end_pos
 
-        # 高亮单行注释
         start = '1.0'
         while True:
             pos = self.code_text.search('//', start, tk.END)
@@ -1118,8 +5699,65 @@ class ExternMapperApp:
             self.code_text.tag_add('comment', pos, line_end)
             start = line_end
 
+    def _generate_markdown(self):
+        if not self.mappings:
+            messagebox.showwarning("警告", "请先添加映射关系！")
+            return
+
+        generator = MarkdownDocumentGenerator(self)
+        self.generated_markdown = generator.generate()
+
+        self.md_text.delete('1.0', tk.END)
+        self.md_text.insert('1.0', self.generated_markdown)
+        self.status_var.set("已生成 Markdown 文档")
+
+    def _copy_markdown(self):
+        md = self.md_text.get('1.0', tk.END).strip()
+        if not md:
+            messagebox.showwarning("警告", "没有可复制的文档！请先生成文档。")
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(md)
+        self.status_var.set("Markdown 文档已复制到剪贴板")
+
+    def _copy_code_and_markdown(self):
+        code = self.code_text.get('1.0', tk.END).strip()
+        md = self.md_text.get('1.0', tk.END).strip()
+
+        if not code and not md:
+            messagebox.showwarning("警告", "请先生成代码或文档。")
+            return
+
+        content = f"{md}\n\n---\n\n## Generated Code\n\n```c\n{code}\n```"
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.status_var.set("代码和文档已复制到剪贴板")
+
+    def _save_markdown(self):
+        md = self.md_text.get('1.0', tk.END).strip()
+        if not md:
+            messagebox.showwarning("警告", "没有可保存的文档！请先生成文档。")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="保存 Markdown 文档",
+            defaultextension=".md",
+            filetypes=[("Markdown 文件", "*.md"), ("所有文件", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(md)
+            messagebox.showinfo("成功", f"文档已保存到: {file_path}")
+            self.status_var.set(f"文档已保存: {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
     def _copy_code(self):
-        """复制生成的代码到剪贴板"""
         code = self.code_text.get('1.0', tk.END).strip()
         if not code:
             messagebox.showwarning("警告", "没有可复制的代码！请先生成代码。")
@@ -1130,7 +5768,6 @@ class ExternMapperApp:
         self.status_var.set("代码已复制到剪贴板")
 
     def _save_code(self):
-        """保存生成的代码到文件"""
         code = self.code_text.get('1.0', tk.END).strip()
         if not code:
             messagebox.showwarning("警告", "没有可保存的代码！请先生成代码。")
@@ -1152,54 +5789,55 @@ class ExternMapperApp:
         except Exception as e:
             messagebox.showerror("错误", f"保存失败: {e}")
 
-    # ── 辅助方法 ──────────────────────────────────────────────────
-
-    @staticmethod
-    def _get_timestamp() -> str:
-        """获取当前时间戳"""
-        from datetime import datetime
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     def _show_help(self):
-        """显示帮助信息"""
         help_text = """
 ═══════════════════════════════════════════
-        Extern 变量映射工具 - 使用说明
+    Extern 变量映射工具 v5.0 - 使用说明
 ═══════════════════════════════════════════
 
-1. 打开头文件
-   • 点击"浏览..."或菜单"文件→打开头文件"
-   • 选择包含 extern 声明的 .h 文件
-   • 工具会自动解析 extern 变量和结构体定义
+【简单模式】（默认）
 
-2. 选择 Extern 变量
-   • 在左侧列表中点击选择一个 extern 变量
-   • 中间面板会显示该变量的成员（如果是结构体）
+  工作流: 需求文档 → 映射文档 → C 代码
 
-3. 定义用户变量
-   • 在右侧"用户变量"标签页中添加自定义变量
-   • 支持单个添加和批量添加
+  1. 加载需求文档
+     • 点击"📂 加载 doc/docx/txt/md"按钮
+     • 支持 Word 文档(.docx)、文本文件(.txt)、Markdown(.md)
+     • 也可加载一个 .h 头文件为 AI 提供结构体上下文
 
-4. 配置映射关系
-   • 在"映射关系"标签页中选择 extern 成员和用户变量
-   • 选择操作类型：直接赋值、条件赋值、逻辑判断、自定义表达式
-   • 可设置转换规则和条件表达式
+  2. AI 生成映射文档
+     • 点击"🤖 AI: 文档→映射文档"按钮
+     • AI 分析需求文档，自动生成标准格式的映射文档
+     • 生成的映射文档可在阶段2中手动编辑调整
 
-5. 生成代码
-   • 点击"生成代码"按钮
-   • 选择代码模板（赋值函数、条件判断函数等）
-   • 可复制或保存生成的代码
+  3. 生成 C 代码
+     • 方式一: 点击"🐍 本地生成代码"（不需要 AI，Python 本地解析）
+     • 方式二: 点击"🤖 AI 生成代码"（AI 理解语义，更智能）
+     • 生成的代码可复制或保存为 .c/.h 文件
 
-6. 导入/导出
-   • 支持将映射配置导出为 JSON 文件
-   • 可导入之前保存的配置
+  4. 保存/加载映射文档
+     • 映射文档可保存为 .md 文件，下次直接加载复用
+     • 也可导出到高级模式进行更精细的调整
 
-快捷键:
-   Ctrl+O: 打开文件
+【高级模式】
+
+  通过菜单"模式→高级模式"切换。
+  提供完整的 extern 变量选择、用户变量定义、条件构建器等功能。
+  适合需要手动精细控制映射关系的场景。
+
+【LLM 配置】
+
+  • 配置文件: miapikey.txt（3行格式: API Key, URL, 模型名）
+  • 默认已配置为小米 MiMo API
+  • 可通过菜单"工具→LLM 服务设置"修改配置
+  • 可通过"测试 LLM 连接"验证配置
+
+【快捷键】
+
+  Ctrl+O: 加载需求文档
 """
         dialog = tk.Toplevel(self.root)
         dialog.title("使用说明")
-        dialog.geometry("520x580")
+        dialog.geometry("560x700")
         dialog.transient(self.root)
 
         text = scrolledtext.ScrolledText(dialog, wrap=tk.WORD, font=('Microsoft YaHei UI', 10))
@@ -1210,24 +5848,26 @@ class ExternMapperApp:
         ttk.Button(dialog, text="关闭", command=dialog.destroy).pack(pady=10)
 
     def _show_about(self):
-        """显示关于信息"""
         messagebox.showinfo(
             "关于",
-            "Extern 变量映射工具 v1.0\n\n"
-            "用于读取C语言头文件中的 extern 变量声明，\n"
-            "并将 extern 变量的成员与用户自定义变量\n"
-            "进行对应赋值和逻辑判断的代码生成工具。\n\n"
+            "Extern 变量映射工具 v5.0\n\n"
+            "核心工作流:\n"
+            "  需求文档(doc/docx) → 映射文档 → C 代码\n\n"
+            "• 📥 加载 Word/文本/Markdown 需求文档\n"
+            "• 🤖 AI 自动分析文档生成映射关系\n"
+            "• 📝 映射文档可编辑调整\n"
+            "• 💻 本地/AI 双路径生成 C 代码\n"
+            "• 🔧 高级模式支持手动精细配置\n\n"
+            "LLM: 小米 MiMo API (MIMO-V2.5-Pro)\n"
+            "配置: miapikey.txt (key/url/model)\n\n"
             "基于 Python + tkinter 构建\n"
             "© 2026 Struct Converter Toolkit"
         )
 
 
-# ── 入口 ──────────────────────────────────────────────────────────
-
 def main():
     root = tk.Tk()
 
-    # 设置窗口图标（如果有的话）
     try:
         root.iconbitmap(default='')
     except Exception:

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temp / generated
+*.exe
+*.o
+*.gcda
+*.gcno
+*.gcov
+test_workflow/generated_*
+
+# API keys (keep template only)
+miapikey.txt
+
+# Test artifacts
+tests/
+test_workflow/

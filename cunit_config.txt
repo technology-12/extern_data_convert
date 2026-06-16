@@ -1,0 +1,16 @@
+# CUnit 路径配置文件
+# 如果自动检测找不到 CUnit，手动指定路径（两行）
+# 第一行: 头文件目录（包含 CUnit/CUnit.h 的父目录）
+# 第二行: 库文件目录（包含 libcunit.a 的目录）
+#
+# 示例 (MSYS2):
+# C:/msys64/mingw64/include
+# C:/msys64/mingw64/lib
+#
+# 示例 (Linux):
+# /usr/include
+# /usr/lib
+#
+# 取消注释并修改以下两行:
+# /path/to/cunit/include
+# /path/to/cunit/lib

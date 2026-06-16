@@ -1849,7 +1849,7 @@ class ExternMapperApp:
             messagebox.showerror("错误", f"加载头文件失败: {e}")
 
     def _simple_ai_doc_to_mapping(self):
-        """AI: 需求文档 → 映射文档"""
+        """AI: 需求文档 → 映射文档（支持大文档自动分块）"""
         if not self.llm_service.is_configured():
             messagebox.showwarning("警告", "LLM 服务未配置！请检查 miapikey.txt 文件。")
             return
@@ -1858,17 +1858,135 @@ class ExternMapperApp:
             messagebox.showwarning("警告", "请先加载需求文档！")
             return
 
-        self.status_var.set("🤖 AI 正在分析文档，生成映射关系...")
-        self.root.update_idletasks()
+        # 合并所有头文件
+        all_headers = self.header_content or ""
+        if self.target_header_content:
+            all_headers += "\n\n" + self.target_header_content
 
-        def call_llm():
-            success, result = self.llm_service.convert_doc_to_mapping_doc(
-                self.doc_content, self.header_content
-            )
-            self.root.after(0, lambda: self._on_simple_mapping_result(success, result))
+        # 判断是否需要分块（文档超过 3000 字符或头文件超过 2000 字符）
+        doc_len = len(self.doc_content)
+        hdr_len = len(all_headers)
+        need_chunk = (doc_len + hdr_len) > 5000
 
-        thread = threading.Thread(target=call_llm, daemon=True)
-        thread.start()
+        if need_chunk:
+            self.status_var.set(f"🤖 文档较大({doc_len}字符)，自动分块处理中...")
+            self.root.update_idletasks()
+
+            def call_llm_chunked():
+                results = []
+                chunks = self._split_doc_by_structs(self.doc_content)
+                total = len(chunks)
+
+                for i, chunk in enumerate(chunks):
+                    self.root.after(0, lambda i=i, t=total: self.status_var.set(
+                        f"🤖 分块处理: {i+1}/{t}..."
+                    ))
+                    # 只传相关的头文件片段
+                    chunk_hdr = self._extract_relevant_headers(chunk, all_headers)
+                    success, result = self.llm_service.convert_doc_to_mapping_doc(chunk, chunk_hdr)
+                    if success:
+                        doc = self._extract_mapping_doc_from_response(result)
+                        results.append(doc)
+                    else:
+                        results.append(f"/* 分块 {i+1} 生成失败: {result} */")
+
+                # 合并所有分块结果
+                merged = self._merge_mapping_chunks(results)
+                self.root.after(0, lambda: self._on_simple_mapping_result(True, merged))
+
+            thread = threading.Thread(target=call_llm_chunked, daemon=True)
+            thread.start()
+        else:
+            self.status_var.set("🤖 AI 正在分析文档，生成映射关系...")
+            self.root.update_idletasks()
+
+            def call_llm():
+                success, result = self.llm_service.convert_doc_to_mapping_doc(
+                    self.doc_content, all_headers
+                )
+                self.root.after(0, lambda: self._on_simple_mapping_result(success, result))
+
+            thread = threading.Thread(target=call_llm, daemon=True)
+            thread.start()
+
+    def _split_doc_by_structs(self, doc: str) -> list:
+        """按结构体/章节分割文档，每块独立处理"""
+        import re
+        # 按一级标题或二级标题分割
+        sections = re.split(r'\n(?=#\s|##\s)', doc)
+        # 如果没有标题，按段落数量分割
+        if len(sections) <= 1:
+            paragraphs = doc.split('\n\n')
+            chunks = []
+            current = []
+            current_len = 0
+            for p in paragraphs:
+                if current_len + len(p) > 2500 and current:
+                    chunks.append('\n\n'.join(current))
+                    current = [p]
+                    current_len = len(p)
+                else:
+                    current.append(p)
+                    current_len += len(p)
+            if current:
+                chunks.append('\n\n'.join(current))
+            return chunks if chunks else [doc]
+        return [s for s in sections if s.strip()]
+
+    def _extract_relevant_headers(self, doc_chunk: str, all_headers: str) -> str:
+        """从文档片段中提取关键词，只保留相关的头文件片段"""
+        import re
+        # 提取文档中出现的结构体名
+        struct_names = re.findall(r'\b([A-Z]\w+_t)\b', doc_chunk)
+        struct_names = list(set(struct_names))
+
+        if not struct_names:
+            # 没有找到结构体名，返回全部头文件（截断）
+            return all_headers[:3000]
+
+        # 按结构体名切分头文件
+        relevant_parts = []
+        for name in struct_names:
+            # 找到包含该结构体定义的代码块
+            pattern = rf'typedef\s+struct.*?\b{name}\s*;'
+            match = re.search(pattern, all_headers, re.DOTALL)
+            if match:
+                relevant_parts.append(match.group(0))
+
+        if relevant_parts:
+            return '\n\n'.join(relevant_parts)
+        return all_headers[:3000]
+
+    def _merge_mapping_chunks(self, chunks: list) -> str:
+        """合并多个映射文档分块"""
+        # 收集所有表格行，去重
+        all_lines = []
+        seen_rows = set()
+        header_added = False
+
+        for chunk in chunks:
+            lines = chunk.strip().split('\n')
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # 跳过分块中的重复标题
+                if stripped.startswith('# '):
+                    if not header_added:
+                        all_lines.append(stripped)
+                        header_added = True
+                    continue
+                # 表格行去重
+                if '|' in stripped and '---' not in stripped:
+                    if stripped not in seen_rows:
+                        seen_rows.add(stripped)
+                        all_lines.append(stripped)
+                else:
+                    if stripped not in seen_rows:
+                        seen_rows.add(stripped)
+                        all_lines.append(stripped)
+
+        return '\n'.join(all_lines)
 
     def _on_simple_mapping_result(self, success: bool, result: str):
         """AI 生成映射文档的回调"""

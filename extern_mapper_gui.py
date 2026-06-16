@@ -1623,9 +1623,9 @@ class ExternMapperApp:
                 self.simple_llm_status.set("⚠️ LLM 未配置，请检查 miapikey.txt")
 
     def _load_document(self):
-        """加载需求文档 (doc/docx/txt/md)"""
+        """加载需求文档 (doc/docx/txt/md)，支持自由格式"""
         file_path = filedialog.askopenfilename(
-            title="选择需求文档",
+            title="选择需求文档（支持自由格式）",
             filetypes=[
                 ("Word 文档", "*.docx *.doc"),
                 ("文本文件", "*.txt"),
@@ -1641,25 +1641,8 @@ class ExternMapperApp:
             ext = os.path.splitext(file_path)[1].lower()
 
             if ext in ('.docx', '.doc'):
-                try:
-                    from docx import Document as DocxDocument
-                    doc = DocxDocument(file_path)
-                    paragraphs = []
-                    for p in doc.paragraphs:
-                        paragraphs.append(p.text)
-                    # 也读取表格内容
-                    for table in doc.tables:
-                        for row in table.rows:
-                            cells = [cell.text.strip() for cell in row.cells]
-                            paragraphs.append(' | '.join(cells))
-                    content = "\n".join(paragraphs)
-                except ImportError:
-                    messagebox.showwarning(
-                        "提示",
-                        "读取 .docx 文件需要安装 python-docx 库。\n"
-                        "请运行: pip install python-docx\n\n"
-                        "您也可以将文档另存为 .txt 或 .md 格式后加载。"
-                    )
+                content = self._parse_docx(file_path)
+                if content is None:
                     return
             else:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -1680,6 +1663,115 @@ class ExternMapperApp:
 
         except Exception as e:
             messagebox.showerror("错误", f"加载文档失败: {e}")
+
+    def _parse_docx(self, file_path: str) -> str:
+        """解析 docx 文档，保留结构（标题、表格、列表、加粗等）
+
+        将 Word 文档结构转为 Markdown 风格的纯文本，方便 LLM 理解。
+        支持：标题层级、表格、有序/无序列表、加粗、段落。
+        """
+        try:
+            from docx import Document as DocxDocument
+            from docx.oxml.ns import qn
+        except ImportError:
+            messagebox.showwarning(
+                "提示",
+                "读取 .docx 文件需要安装 python-docx 库。\n"
+                "请运行: pip install python-docx\n\n"
+                "您也可以将文档另存为 .txt 或 .md 格式后加载。"
+            )
+            return None
+
+        doc = DocxDocument(file_path)
+        lines = []
+
+        for element in doc.element.body:
+            tag = element.tag.split('}')[-1] if '}' in element.tag else element.tag
+
+            if tag == 'p':
+                # 段落：检测标题、列表、普通段落
+                from docx.text.paragraph import Paragraph
+                para = Paragraph(element, doc)
+                text = para.text.strip()
+                if not text:
+                    lines.append('')
+                    continue
+
+                style_name = para.style.name if para.style else ''
+
+                # 标题
+                if style_name.startswith('Heading'):
+                    try:
+                        level = int(style_name.replace('Heading ', '').strip())
+                    except ValueError:
+                        level = 1
+                    prefix = '#' * level
+                    lines.append(f'{prefix} {text}')
+                    continue
+
+                # 列表项
+                numPr = element.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numPr')
+                if numPr is not None:
+                    # 检测是有序还是无序
+                    numId = numPr.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numId')
+                    ilvl = numPr.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ilvl')
+                    indent = '  ' * (int(ilvl.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val', '0')) if ilvl is not None else 0)
+                    if numId is not None:
+                        # 简单判断：numId 存在就是列表
+                        # 检查是否为 bullet list（通常 numId 较小）
+                        lines.append(f'{indent}- {text}')
+                        continue
+
+                # 加粗文本标记
+                formatted_parts = []
+                for run in para.runs:
+                    run_text = run.text
+                    if not run_text:
+                        continue
+                    if run.bold:
+                        formatted_parts.append(f'**{run_text}**')
+                    elif run.italic:
+                        formatted_parts.append(f'*{run_text}*')
+                    else:
+                        formatted_parts.append(run_text)
+
+                if formatted_parts:
+                    lines.append(''.join(formatted_parts))
+                else:
+                    lines.append(text)
+
+            elif tag == 'tbl':
+                # 表格：转为 Markdown 表格格式
+                from docx.table import Table
+                table = Table(element, doc)
+                table_data = []
+                for row in table.rows:
+                    cells = [cell.text.strip().replace('\n', ' ') for cell in row.cells]
+                    table_data.append(cells)
+
+                if table_data:
+                    # 去重（Word 表格的 cells 可能有重复）
+                    seen = set()
+                    unique_data = []
+                    for row in table_data:
+                        row_key = tuple(row)
+                        if row_key not in seen:
+                            seen.add(row_key)
+                            unique_data.append(row)
+
+                    if unique_data:
+                        # Markdown 表格
+                        max_cols = max(len(r) for r in unique_data)
+                        for i, row in enumerate(unique_data):
+                            # 补齐列数
+                            while len(row) < max_cols:
+                                row.append('')
+                            lines.append('| ' + ' | '.join(row) + ' |')
+                            # 表头后加分隔线
+                            if i == 0:
+                                lines.append('| ' + ' | '.join(['---'] * max_cols) + ' |')
+
+        return '\n'.join(lines)
 
     def _load_header_file(self):
         """加载可选的头文件，为 LLM 提供结构体上下文"""

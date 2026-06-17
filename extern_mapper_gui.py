@@ -1467,7 +1467,8 @@ class ExternMapperApp:
         self.llm_service = LLMService()
         self.doc_content = ""
         self.doc_file_path = ""
-        self.header_content = ""  # 可选的头文件内容
+        self.header_content = ""  # 可选的源头文件内容
+        self.target_header_content = ""  # 可选的目标头文件内容
         self.mapping_doc_content = ""  # 规范映射文档（中间产物）
         self.generated_code = ""
 
@@ -1557,14 +1558,23 @@ class ExternMapperApp:
             side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(doc_row, text="📂 加载 doc/docx/txt/md", command=self._load_document).pack(side=tk.LEFT, padx=2)
 
-        # 头文件行
+        # 源头文件行
         hdr_row = ttk.Frame(stage1)
         hdr_row.pack(fill=tk.X, pady=2)
-        ttk.Label(hdr_row, text="头文件(可选):", style='Info.TLabel').pack(side=tk.LEFT)
+        ttk.Label(hdr_row, text="源头文件(可选):", style='Info.TLabel').pack(side=tk.LEFT)
         self.simple_hdr_var = tk.StringVar(value="未加载头文件")
         ttk.Entry(hdr_row, textvariable=self.simple_hdr_var, state='readonly', width=50).pack(
             side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(hdr_row, text="📂 加载 .h", command=self._load_header_file).pack(side=tk.LEFT, padx=2)
+
+        # 目标头文件行
+        tgt_hdr_row = ttk.Frame(stage1)
+        tgt_hdr_row.pack(fill=tk.X, pady=2)
+        ttk.Label(tgt_hdr_row, text="目标头文件(可选):", style='Info.TLabel').pack(side=tk.LEFT)
+        self.simple_tgt_hdr_var = tk.StringVar(value="未加载头文件")
+        ttk.Entry(tgt_hdr_row, textvariable=self.simple_tgt_hdr_var, state='readonly', width=50).pack(
+            side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(tgt_hdr_row, text="📂 加载 .h", command=self._load_target_header_file).pack(side=tk.LEFT, padx=2)
 
         # AI 按钮行
         ai_row = ttk.Frame(stage1)
@@ -1847,6 +1857,38 @@ class ExternMapperApp:
 
         except Exception as e:
             messagebox.showerror("错误", f"加载头文件失败: {e}")
+
+    def _load_target_header_file(self):
+        """加载目标头文件，为 LLM 提供目标结构体上下文"""
+        file_path = filedialog.askopenfilename(
+            title="选择目标头文件（可选）",
+            filetypes=[
+                ("C 头文件", "*.h"),
+                ("C 源文件", "*.c"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                self.target_header_content = f.read()
+
+            # 同时用 target_parser 解析
+            self.target_parser.parse_file(file_path)
+
+            if hasattr(self, 'simple_tgt_hdr_var'):
+                self.simple_tgt_hdr_var.set(file_path)
+
+            summary = self.target_parser.get_summary()
+            self.status_var.set(
+                f"✅ 已加载目标头文件: {os.path.basename(file_path)} | "
+                f"结构体: {summary['struct_count']} | Extern: {summary['extern_var_count']}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("错误", f"加载目标头文件失败: {e}")
 
     def _simple_ai_doc_to_mapping(self):
         """AI: 需求文档 → 映射文档（支持大文档自动分块）"""
@@ -6105,7 +6147,7 @@ class ExternMapperApp:
   1. 加载需求文档
      • 点击"📂 加载 doc/docx/txt/md"按钮
      • 支持 Word 文档(.docx)、文本文件(.txt)、Markdown(.md)
-     • 也可加载一个 .h 头文件为 AI 提供结构体上下文
+     • 可加载源头文件和目标头文件，为 AI 提供结构体上下文
 
   2. AI 生成映射文档
      • 点击"🤖 AI: 文档→映射文档"按钮

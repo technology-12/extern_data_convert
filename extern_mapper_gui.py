@@ -1579,6 +1579,8 @@ class ExternMapperApp:
         # AI 按钮行
         ai_row = ttk.Frame(stage1)
         ai_row.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(ai_row, text="🔗 测试 API",
+                   command=self._test_api_connection).pack(side=tk.LEFT, padx=2)
         ttk.Button(ai_row, text="🤖 AI: 文档 → 映射文档",
                    command=self._simple_ai_doc_to_mapping, style='Accent.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(ai_row, text="⚡ AI: 文档 → 直接生成代码",
@@ -1674,6 +1676,47 @@ class ExternMapperApp:
                 )
             else:
                 self.simple_llm_status.set("⚠️ LLM 未配置，请检查 miapikey.txt")
+
+    def _test_api_connection(self):
+        """测试 API 连通性"""
+        if not self.llm_service.is_configured():
+            messagebox.showwarning("警告", "LLM 服务未配置！请检查 miapikey.txt 文件。")
+            return
+
+        self.status_var.set("🔗 正在测试 API 连通性...")
+        self.root.update_idletasks()
+
+        def do_test():
+            import time
+            start = time.time()
+            success, result = self.llm_service.call_llm(
+                "请回复\"连接成功\"四个字，不要输出其他内容。",
+                max_retries=0, timeout=30
+            )
+            elapsed = time.time() - start
+
+            if success:
+                msg = (
+                    f"✅ API 连接测试成功！\n\n"
+                    f"地址: {self.llm_service.base_url}\n"
+                    f"模型: {self.llm_service.model}\n"
+                    f"延迟: {elapsed:.1f} 秒\n"
+                    f"响应: {result[:100]}"
+                )
+                self.root.after(0, lambda: messagebox.showinfo("API 测试结果", msg))
+                self.root.after(0, lambda: self.status_var.set(f"✅ API 测试通过 ({elapsed:.1f}s)"))
+            else:
+                msg = (
+                    f"❌ API 连接测试失败！\n\n"
+                    f"地址: {self.llm_service.base_url}\n"
+                    f"模型: {self.llm_service.model}\n"
+                    f"错误: {result[:300]}\n\n"
+                    f"请检查 miapikey.txt 中的 API Key 和 URL 是否正确。"
+                )
+                self.root.after(0, lambda: messagebox.showerror("API 测试结果", msg))
+                self.root.after(0, lambda: self.status_var.set("❌ API 测试失败"))
+
+        threading.Thread(target=do_test, daemon=True).start()
 
     def _load_document(self):
         """加载需求文档 (doc/docx/txt/md)，支持自由格式"""
